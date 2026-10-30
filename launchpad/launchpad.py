@@ -206,6 +206,16 @@ def scale(base, level):
     return tuple(int(v * level) for v in base)
 
 
+def on_pad(c, level):
+    """Farbe der Decke fürs Launchpad: jede Helligkeitsstufe sieht dort sichtbar anders aus."""
+    m = max(c)
+    if m == 0:
+        return (0, 0, 0)
+    light = (m / 255 * (0.4 + 0.6 * level)) ** 1.4      # 0..1, wie das Auge Helligkeit sieht
+    top = max(1, round(63 * light))                      # Launchpad kann 0..63
+    return tuple(math.ceil(round(top * v / m) * 255 / 63) for v in c)
+
+
 def hsv(h, s=1.0, v=1.0):
     return tuple(int(x * 255) for x in colorsys.hsv_to_rgb(h % 1, s, v))
 
@@ -432,11 +442,11 @@ def main():
             blink_on = int(now * 3) % 2 == 0
             st = deck().state
             leds = {}
-            level = max(0.15, st["brightness"] / st["max"]) if st else 1.0
+            level = st["brightness"] / st["max"] if st else 1.0
             for i, (r, c) in box_at.items():
-                col = scale(st["frame"][r][c], level) if st else (0, 0, 0)
-                if (r, c) in selected:
-                    col = (col if max(col) > 30 else (90, 90, 90)) if blink_on else (0, 0, 0)
+                col = on_pad(st["frame"][r][c], level) if st else (0, 0, 0)
+                if (r, c) in selected:     # blinkt in seiner echten Helligkeit, aus = grau
+                    col = (col if max(col) > 0 else (60, 60, 60)) if blink_on else (0, 0, 0)
                 leds[i] = col
             for i, col in color_at.items():
                 leds[i] = col
