@@ -78,15 +78,17 @@ class Launchpad:
             return
         self.shown.update(leds)
         s = self.scale
-        if self.kind == "mk2":
-            data = [0x0B]
-            for i, (r, g, b) in leds.items():
-                data += [i, r * s // 255, g * s // 255, b * s // 255]
-        else:
-            data = [0x03]
-            for i, (r, g, b) in leds.items():
-                data += [0x03, i, r * s // 255, g * s // 255, b * s // 255]
-        self._sysex(data)
+        items = list(leds.items())
+        for k in range(0, len(items), 8):   # in kleinen Paketen, lange SysEx gehen am Pi verloren
+            if self.kind == "mk2":
+                data = [0x0B]
+                for i, (r, g, b) in items[k:k + 8]:
+                    data += [i, r * s // 255, g * s // 255, b * s // 255]
+            else:
+                data = [0x03]
+                for i, (r, g, b) in items[k:k + 8]:
+                    data += [0x03, i, r * s // 255, g * s // 255, b * s // 255]
+            self._sysex(data)
 
     def still_there(self):
         """False, wenn das Launchpad abgesteckt (oder neu eingesteckt) wurde."""
