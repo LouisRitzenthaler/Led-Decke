@@ -52,7 +52,8 @@
    **Adafruit NeoPixel**, **ArduinoJson** und **NimBLE-Arduino** installieren.
 4. `led_decke_esp32/led_decke_esp32.ino` öffnen.
 5. *Werkzeuge*: Board **ESP32 Dev Module**, Partition Scheme
-   **Minimal SPIFFS (1.9MB APP with OTA)**, richtigen Port wählen.
+   **Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)** (nicht ändern!
+   Über WLAN lässt sich die Aufteilung nicht umstellen), richtigen Port wählen.
 6. In `config.h` dein WLAN eintragen (`WIFI_SSID`, `WIFI_PASSWORD`).
    Das brauchst du für Updates ohne Kabel, siehe unten.
 7. Für jeden der 7 ESP32:
