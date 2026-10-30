@@ -1,7 +1,7 @@
 #!/bin/bash
 # LED-Decke Launchpad auf dem Raspberry Pi einrichten.
 # Aufruf:  curl -sSL https://raw.githubusercontent.com/LouisRitzenthaler/Led-Decke/main/launchpad/install.sh | bash
-set -e
+set -eE
 trap 'echo; echo "FEHLER in Zeile $LINENO - bitte Foto an Claude schicken"' ERR
 
 # Alles in einer Funktion, damit "curl | bash" sicher das ganze Skript liest
