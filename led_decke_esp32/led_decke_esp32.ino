@@ -106,7 +106,7 @@ static_assert(sizeof(CRGB) == 3, "CRGB muss 3 Bytes groß sein");
 
 CRGB frame[ROWS][COLS];        // aktuelles Bild der ganzen Decke
 uint8_t shownBrightness = 0;
-const uint8_t BROADCAST[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+const uint8_t ESPNOW_BROADCAST_ADDR[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 void showMyRow() {
   for (int k = 0; k < NUM_STRIPS; k++) {
@@ -535,7 +535,7 @@ void setup() {
   loadState();
   startRadio();
   esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, BROADCAST, 6);
+  memcpy(peer.peer_addr, ESPNOW_BROADCAST_ADDR, 6);
   peer.channel = 0;  // aktueller Kanal
   peer.ifidx = WIFI_IF_STA;
   peer.encrypt = false;
@@ -569,7 +569,7 @@ void loop() {
     txPacket.version = 1;
     txPacket.brightness = shownBrightness;
     memcpy(txPacket.frame, frame, sizeof(frame));
-    esp_now_send(BROADCAST, (const uint8_t *)&txPacket, sizeof(txPacket));
+    esp_now_send(ESPNOW_BROADCAST_ADDR, (const uint8_t *)&txPacket, sizeof(txPacket));
     showMyRow();
   }
   delay(1);
