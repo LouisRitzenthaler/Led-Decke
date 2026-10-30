@@ -7,7 +7,9 @@ Belegung (Launchpad liegt normal, Logo oben rechts):
   - rechte Spalte von oben: Helligkeit +, Helligkeit -, Farbverlauf +,
     Farbverlauf -, Rot, Grün, Blau, Weiß
 
-Kasten drücken: bekommt die gewählte Farbe; hat er sie schon, geht er aus.
+Kasten drücken: er blinkt (ausgewählt), nochmal drücken: abgewählt. Die Tasten
+rechts ändern dann Farbe, Farbverlauf und Helligkeit der ausgewählten Kästen.
+Ist nichts ausgewählt, ändert Helligkeit +/- die ganze Decke.
 Der Pi schickt die Befehle per WLAN (UDP) an den Chef-ESP32 und zeigt auf dem
 Launchpad immer die echten Farben der Decke an.
 """
@@ -162,6 +164,18 @@ def dim(c, f):
 # ---------------------------------------------------------------------
 #  Hauptprogramm
 # ---------------------------------------------------------------------
+def split(c):
+    """Farbe -> (Grundfarbe in voller Helligkeit, Helligkeit 0..1)."""
+    m = max(c)
+    if m == 0:
+        return None, 0.0
+    return tuple(v * 255 // m for v in c), round(m / 255 * 10) / 10
+
+
+def scale(base, level):
+    return tuple(int(v * level) for v in base)
+
+
 def main():
     while True:
         try:
@@ -172,8 +186,9 @@ def main():
             time.sleep(5)
 
     chef = Chef()
-    color = BASIC["red"]
-    hue = 0.0
+    selected = set()          # ausgewählte Kästen (blinken)
+    remembered = {}           # Grundfarbe von Kästen, die per Helligkeit ganz aus sind
+    last_color = BASIC["white"]
 
     # Tasten-Index -> was sie tun
     box_at, line_at, func_at = {}, {}, {}
@@ -185,35 +200,60 @@ def main():
     for k, f in enumerate(FUNCTIONS):  # rechte Spalte, von oben nach unten
         func_at[(8 - k) * 10 + 9] = f
 
+    def apply(changes):
+        """changes: {(r, c): farbe} -> an die Decke, gleiche Farben in einem Befehl."""
+        by_color = {}
+        for cell, col in changes.items():
+            by_color.setdefault(col, []).append(list(cell))
+        for col, cells in by_color.items():
+            chef.send({"op": "boxes", "color": hexcolor(col), "cells": cells})
+
+    def on_function(f, st):
+        nonlocal last_color
+        if not selected:
+            if f in ("bri+", "bri-") and st:   # nichts ausgewählt: ganze Decke heller/dunkler
+                step = BRIGHTNESS_STEP if f == "bri+" else -BRIGHTNESS_STEP
+                chef.send({"op": "settings", "brightness": max(0, min(st["max"], st["brightness"] + step))})
+            elif f in BASIC:
+                last_color = BASIC[f]
+            return
+        if not st:
+            return
+        changes = {}
+        for r, c in selected:
+            base, level = split(st["boxes"][r][c])
+            if f in BASIC:
+                last_color = BASIC[f]
+                changes[(r, c)] = scale(BASIC[f], level if level > 0 else 1.0)
+            elif f in ("hue+", "hue-") and base:
+                h, sat, _ = colorsys.rgb_to_hsv(*[v / 255 for v in base])
+                if sat < 0.05:                 # Weiß hat keinen Farbton: bei Rot anfangen
+                    h, sat = 0.0, 1.0
+                h = (h + (HUE_STEP if f == "hue+" else -HUE_STEP)) % 1
+                new_base = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(h, sat, 1))
+                changes[(r, c)] = scale(new_base, level)
+            elif f in ("bri+", "bri-"):
+                if base is None:
+                    base = remembered.get((r, c), last_color)
+                level = round(min(1.0, max(0.0, level + (0.1 if f == "bri+" else -0.1))), 1)
+                if level == 0:
+                    remembered[(r, c)] = base
+                changes[(r, c)] = scale(base, level)
+        apply(changes)
+
     last_poll = 0
     last_warn = -100
     last_check = 0
     while True:
         try:
             for i in lp.presses():
-                st = chef.state
-                if i in box_at and st:
-                    r, c = box_at[i]
-                    new = (0, 0, 0) if st["boxes"][r][c] == color else color
-                    chef.send({"op": "boxes", "color": hexcolor(new), "cells": [[r, c]]})
-                elif i in line_at and st:
-                    r = line_at[i]
-                    full = all(st["boxes"][r][c] == color for c in range(COLS))
-                    new = (0, 0, 0) if full else color
-                    chef.send({"op": "boxes", "color": hexcolor(new), "cells": [[r, c] for c in range(COLS)]})
+                if i in box_at:
+                    selected ^= {box_at[i]}
+                elif i in line_at:
+                    row = {(line_at[i], c) for c in range(COLS)}
+                    selected = selected - row if row <= selected else selected | row
                 elif i in func_at:
-                    f = func_at[i]
-                    if f in BASIC:
-                        color = BASIC[f]
-                        if f != "white":
-                            hue = colorsys.rgb_to_hsv(*[v / 255 for v in color])[0]
-                    elif f in ("hue+", "hue-"):
-                        hue = (hue + (HUE_STEP if f == "hue+" else -HUE_STEP)) % 1
-                        color = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(hue, 1, 1))
-                    elif st:
-                        step = BRIGHTNESS_STEP if f == "bri+" else -BRIGHTNESS_STEP
-                        bri = max(0, min(st["max"], st["brightness"] + step))
-                        chef.send({"op": "settings", "brightness": bri})
+                    on_function(func_at[i], chef.state)
 
             now = time.monotonic()
             if now - last_check >= 2:
@@ -227,18 +267,25 @@ def main():
                     last_warn = now
                     print("Decke antwortet nicht (WLAN an? ESP32 an?)", flush=True)
 
-            # Launchpad anzeigen
+            # Launchpad anzeigen: ausgewählte Kästen blinken
+            blink_on = int(now * 3) % 2 == 0
             leds = {}
             st = chef.state
             for i, (r, c) in box_at.items():
-                leds[i] = st["frame"][r][c] if st else (0, 0, 0)
-            for i in line_at:
-                leds[i] = dim(color, 0.25)
+                col = st["frame"][r][c] if st else (0, 0, 0)
+                if (r, c) in selected:
+                    col = (col if max(col) > 30 else (90, 90, 90)) if blink_on else (0, 0, 0)
+                leds[i] = col
+            for i, r in line_at.items():
+                full = all((r, c) in selected for c in range(COLS))
+                leds[i] = (255, 255, 255) if full and blink_on else (35, 35, 35)
+            first = next(iter(selected), None)
+            sel_color = split(st["boxes"][first[0]][first[1]])[0] if st and first else None
             for i, f in func_at.items():
                 if f in BASIC:
-                    leds[i] = BASIC[f] if BASIC[f] == color else dim(BASIC[f], 0.15)
+                    leds[i] = BASIC[f]
                 elif f.startswith("hue"):
-                    leds[i] = color
+                    leds[i] = sel_color or (60, 60, 60)
                 else:
                     leds[i] = (255, 255, 255) if f == "bri+" else (40, 40, 40)
             lp.show(leds)
