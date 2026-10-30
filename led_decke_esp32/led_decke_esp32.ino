@@ -461,19 +461,36 @@ String sceneNamesJson() {  // Aufrufer hält den Lock
 NimBLECharacteristic *bleState, *bleScenes;
 
 // Zustand binär: [1, mode, helligkeit, max, tempo*10, r,g,b, rows, cols, boxes..., frame...]
+const size_t STATE_SIZE = 10 + ROWS * COLS * 6;
+
+void buildState(uint8_t *buf) {
+  Lock l;
+  buf[0] = 1;
+  buf[1] = (uint8_t)(int8_t)mode;
+  buf[2] = brightness;
+  buf[3] = MAX_BRIGHTNESS;
+  buf[4] = (uint8_t)roundf(speed * 10);
+  buf[5] = fxColor.r; buf[6] = fxColor.g; buf[7] = fxColor.b;
+  buf[8] = ROWS; buf[9] = COLS;
+  memcpy(buf + 10, boxes, ROWS * COLS * 3);
+  memcpy(buf + 10 + ROWS * COLS * 3, frame, ROWS * COLS * 3);
+}
+
+// Befehle als JSON: {"op":"boxes"|"fill"|"settings"|"scene_save"|"scene_load"|"scene_delete"|"get", ...}
+void runCommand(JsonDocument &doc) {
+  String op = doc["op"] | "";
+  if (op == "boxes") cmdBoxes(doc);
+  else if (op == "fill") cmdFill(doc);
+  else if (op == "settings") cmdSettings(doc);
+  else if (op == "scene_save") cmdScene('s', doc["name"] | "");
+  else if (op == "scene_load") cmdScene('l', doc["name"] | "");
+  else if (op == "scene_delete") cmdScene('d', doc["name"] | "");
+}
+
 class StateCallbacks : public NimBLECharacteristicCallbacks {
   void onRead(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
-    static uint8_t buf[10 + ROWS * COLS * 6];
-    Lock l;
-    buf[0] = 1;
-    buf[1] = (uint8_t)(int8_t)mode;
-    buf[2] = brightness;
-    buf[3] = MAX_BRIGHTNESS;
-    buf[4] = (uint8_t)roundf(speed * 10);
-    buf[5] = fxColor.r; buf[6] = fxColor.g; buf[7] = fxColor.b;
-    buf[8] = ROWS; buf[9] = COLS;
-    memcpy(buf + 10, boxes, ROWS * COLS * 3);
-    memcpy(buf + 10 + ROWS * COLS * 3, frame, ROWS * COLS * 3);
+    static uint8_t buf[STATE_SIZE];
+    buildState(buf);
     c->setValue(buf, sizeof(buf));
   }
 };
@@ -485,19 +502,12 @@ class ScenesCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
-// Befehle als JSON: {"op":"boxes"|"fill"|"settings"|"scene_save"|"scene_load"|"scene_delete", ...}
 class CmdCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
     JsonDocument doc;
     NimBLEAttValue v = c->getValue();
     if (deserializeJson(doc, (const char *)v.data(), v.length())) return;
-    String op = doc["op"] | "";
-    if (op == "boxes") cmdBoxes(doc);
-    else if (op == "fill") cmdFill(doc);
-    else if (op == "settings") cmdSettings(doc);
-    else if (op == "scene_save") cmdScene('s', doc["name"] | "");
-    else if (op == "scene_load") cmdScene('l', doc["name"] | "");
-    else if (op == "scene_delete") cmdScene('d', doc["name"] | "");
+    runCommand(doc);
   }
 };
 
@@ -520,6 +530,32 @@ void startBle() {
   adv->start();
   Serial.printf("Bluetooth bereit: \"%s\"\n", BLE_NAME);
 }
+// ---------------------------------------------------------------------
+//  Launchpad am Raspberry Pi: dieselben Befehle per WLAN (UDP).
+//  Jede Nachricht wird mit dem aktuellen Zustand beantwortet.
+// ---------------------------------------------------------------------
+WiFiUDP udp;
+bool udpStarted = false;
+
+void handleUdp() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!udpStarted) udpStarted = udp.begin(UDP_PORT);
+  if (!udpStarted) return;
+  static char in[512];
+  static uint8_t out[STATE_SIZE];
+  for (int k = 0; k < 4; k++) {
+    if (udp.parsePacket() <= 0) return;
+    int n = udp.read((uint8_t *)in, sizeof(in));
+    JsonDocument doc;
+    if (n <= 0 || deserializeJson(doc, in, n)) continue;
+    runCommand(doc);  // {"op":"get"} fragt nur den Zustand ab
+    buildState(out);
+    udp.beginPacket(udp.remoteIP(), udp.remotePort());
+    udp.write(out, STATE_SIZE);
+    udp.endPacket();
+  }
+}
+
 // ---------------------------------------------------------------------
 //  Chef: Hauptschleife
 // ---------------------------------------------------------------------
@@ -548,6 +584,7 @@ void setup() {
 void loop() {
   static unsigned long lastFrame = 0;
   handleNetwork();
+  handleUdp();
   unsigned long now = millis();
   if (now - lastFrame >= 1000 / FPS) {
     {

@@ -26,6 +26,9 @@
 #define OTA_HOSTNAME_PREFIX "led-decke-reihe"   // + Reihen-Nummer
 #define OTA_PASSWORD   ""                       // leer = ohne Passwort
 
+// Port, auf dem der Chef Befehle vom Raspberry Pi (Launchpad) annimmt
+#define UDP_PORT 4210
+
 // --- Funk zwischen den ESP32 (ESP-NOW) -------------------------------
 // Nur benutzt, wenn KEIN WLAN eingetragen ist oder es nicht erreichbar ist.
 // Alle 7 müssen dann auf demselben Kanal sein (1–13).
