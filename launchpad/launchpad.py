@@ -125,13 +125,15 @@ class Chef:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.settimeout(0.3)
-        self.addr = None
+        self.addr = None          # zuletzt bekannte Adresse des ESP32
+        self.named = None         # Adresse über den Namen (wird nebenbei gesucht)
+        self.misses = 0
         self.state = None
-        self.next_lookup = 0
         self.online = False
         self.ever_online = False
         self.todo = queue.Queue()
         threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._lookup, daemon=True).start()
 
     def post(self, cmd):
         """Befehl im Hintergrund schicken – das Launchpad wartet nie auf die Decke."""
@@ -143,32 +145,36 @@ class Chef:
                 cmd = self.todo.get(timeout=POLL)
             except queue.Empty:
                 cmd = {"op": "get"}
-            self.online = self.send(cmd)
-            self.ever_online = self.ever_online or self.online
+            ok = self.send(cmd)
+            if not ok and cmd["op"] != "get":
+                ok = self.send(cmd)            # verlorenen Befehl einmal wiederholen
+            self.online = ok
+            self.ever_online = self.ever_online or ok
 
-    def _find(self):
-        # Den Namen nur alle 30 s nachschlagen (das kann ein paar Sekunden dauern),
-        # sonst einfach an alle im WLAN schicken – der ESP32 antwortet trotzdem.
-        if time.monotonic() >= self.next_lookup:
-            self.next_lookup = time.monotonic() + 30
+    def _lookup(self):
+        # Den Namen nebenbei nachschlagen (kann Sekunden dauern), damit nichts hängt
+        while True:
             try:
-                return (socket.gethostbyname(CHEF_HOST), UDP_PORT)
+                self.named = (socket.gethostbyname(CHEF_HOST), UDP_PORT)
             except OSError:
                 pass
-        return ("255.255.255.255", UDP_PORT)
+            time.sleep(30)
 
     def send(self, cmd):
         """Befehl schicken, Antwort = aktueller Zustand. False, wenn keine Antwort."""
-        if self.addr is None:
-            self.addr = self._find()
+        addr = self.addr or self.named or ("255.255.255.255", UDP_PORT)
         try:
-            self.sock.sendto(json.dumps(cmd).encode(), self.addr)
-            data, sender = self.sock.recvfrom(1024)
+            self.sock.sendto(json.dumps(cmd, separators=(",", ":")).encode(), addr)
+            while True:
+                data, sender = self.sock.recvfrom(1024)
+                if len(data) == 10 + ROWS * COLS * 6 and data[0] == 1:
+                    break
         except OSError:
-            self.addr = None
+            self.misses += 1
+            if self.misses >= 3:               # ESP32 hat neue Adresse? Neu suchen
+                self.addr = None
             return False
-        if len(data) != 10 + ROWS * COLS * 6 or data[0] != 1:
-            return False
+        self.misses = 0
         self.addr = (sender[0], UDP_PORT)
         self.state = {
             "mode": data[1] - 256 if data[1] > 127 else data[1],
@@ -240,6 +246,10 @@ class SimDecke:
             col = tuple(int(cmd["color"][i:i + 2], 16) for i in (1, 3, 5))
             for r, c in cmd["cells"]:
                 self.boxes[r][c] = col
+            self.mode = -1
+        elif op == "fill":
+            col = tuple(int(cmd["color"][i:i + 2], 16) for i in (1, 3, 5))
+            self.boxes = [[col] * COLS for _ in range(ROWS)]
             self.mode = -1
         elif op == "settings":
             if "brightness" in cmd:
@@ -330,7 +340,11 @@ def main():
         for cell, col in changes.items():
             by_color.setdefault(col, []).append(list(cell))
         for col, cells in by_color.items():
-            d.post({"op": "boxes", "color": hexcolor(col), "cells": cells})
+            if len(cells) == ROWS * COLS:
+                d.post({"op": "fill", "color": hexcolor(col)})
+                continue
+            for k in range(0, len(cells), 20):     # der ESP32 nimmt max. 512 Zeichen pro Befehl
+                d.post({"op": "boxes", "color": hexcolor(col), "cells": cells[k:k + 20]})
         st = d.state
         if st and d is chef:           # sofort merken, damit schnelles Drücken nicht verloren geht
             for (r, c), col in changes.items():
@@ -367,8 +381,12 @@ def main():
             if lit:
                 saved = lit
             apply(d, {(r, c): (0, 0, 0) for r in range(ROWS) for c in range(COLS)})
-        else:                          # ganze Decke wieder an (wie vorher, sonst weiß)
+        else:                          # ganze Decke wieder an (wie vorher, sonst weiß), Effekt aus
             if any(max(boxes[r][c]) > 0 for r in range(ROWS) for c in range(COLS)):
+                if st["mode"] >= 0:
+                    d.post({"op": "settings", "mode": "static"})
+                    if d is chef:
+                        st["mode"] = -1
                 return
             apply(d, saved or {(r, c): (255, 255, 255) for r in range(ROWS) for c in range(COLS)})
 
