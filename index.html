@@ -211,7 +211,13 @@ function bleStatus(text, showButton) {
 }
 async function bleAttach(device) {
   const server = await device.gatt.connect();
-  const svc = await server.getPrimaryService(UUID.svc);
+  let svc;
+  try {
+    svc = await server.getPrimaryService(UUID.svc);
+  } catch (e) {
+    device.gatt.disconnect();
+    throw new Error("Auf diesem ESP32 läuft noch nicht die LED-Decken-Firmware. Bitte zuerst die neue Firmware über WLAN hochladen.");
+  }
   const c = {};
   for (const k of ["cmd", "state", "scenes"]) c[k] = await svc.getCharacteristic(UUID[k]);
   ble = { device, ...c };
@@ -235,13 +241,13 @@ if (USE_BLE) {
   }
   $("bleConnect").onclick = async () => {
     try {
-      const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [UUID.svc] }] });
+      const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [UUID.svc] }, { namePrefix: "LED" }], optionalServices: [UUID.svc] });
       device.addEventListener("gattserverdisconnected", () => bleReconnect(device));
       bleStatus("Verbinde …", false);
       await bleAttach(device);
     } catch (e) {
       ble = null;
-      bleStatus(e.name === "NotFoundError" ? "Keine Decke ausgewählt." : "Verbinden fehlgeschlagen: " + e.message, true);
+      bleStatus(e.name === "NotFoundError" ? "Keine Decke gefunden oder ausgewählt. Ist eine andere App (z. B. Bluefruit) noch verbunden? Dann diese ganz schließen." : "Verbinden fehlgeschlagen: " + e.message, true);
     }
   };
 }
