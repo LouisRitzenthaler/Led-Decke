@@ -1,7 +1,7 @@
 // LED-Decke – Firmware für EINEN ESP32, der alle 14 Streifen steuert
 //
-// Der ESP32 verbindet sich per Bluetooth mit der Steuerseite am Handy und per
-// Bluetooth mit dem Raspberry Pi (Launchpad). Nur Updates gehen per WLAN (OTA).
+// Der ESP32 verbindet sich per Bluetooth mit der Steuerseite am Handy und mit
+// dem Raspberry Pi (Launchpad). Nur Updates gehen per WLAN (OTA).
 // Einstellungen stehen direkt hier unten.
 
 #include <Arduino.h>
