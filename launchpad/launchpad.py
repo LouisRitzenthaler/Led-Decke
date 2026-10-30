@@ -9,6 +9,8 @@ Belegung (Launchpad liegt normal, Logo oben rechts):
 
 Kasten drücken: er blinkt (ausgewählt), nochmal drücken: abgewählt. Die Tasten
 rechts ändern dann Farbe, Farbverlauf und Helligkeit der ausgewählten Kästen.
+Nach einer Farbe ist die Auswahl sofort weg, nach Helligkeit/Verlauf 2,5 s nach
+dem letzten Drücken (so kann man mehrmals drücken).
 Ist nichts ausgewählt, ändert Helligkeit +/- die ganze Decke.
 Der Pi schickt die Befehle per WLAN (UDP) an den Chef-ESP32 und zeigt auf dem
 Launchpad immer die echten Farben der Decke an.
@@ -29,6 +31,7 @@ ROWS, COLS = 9, 7
 BRIGHTNESS_STEP = 16
 HUE_STEP = 1 / 24                      # 24 Schritte = einmal durch den Farbkreis
 POLL = 0.1                             # so oft (Sekunden) die Farben der Decke holen
+DESELECT_AFTER = 2.5                   # Auswahl endet so viele Sekunden nach Helligkeit/Verlauf
 
 FUNCTIONS = ["bri+", "bri-", "hue+", "hue-", "red", "green", "blue", "white"]
 BASIC = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255), "white": (255, 255, 255)}
@@ -228,8 +231,10 @@ def main():
             for (r, c), col in changes.items():
                 chef.state["boxes"][r][c] = col
 
+    deselect_at = None        # Zeitpunkt, an dem die Auswahl nach Helligkeit/Verlauf endet
+
     def on_function(f, st):
-        nonlocal last_color
+        nonlocal last_color, deselect_at
         if not selected:
             if f in ("bri+", "bri-") and st:   # nichts ausgewählt: ganze Decke heller/dunkler
                 step = BRIGHTNESS_STEP if f == "bri+" else -BRIGHTNESS_STEP
@@ -261,12 +266,20 @@ def main():
                     remembered[(r, c)] = base
                 changes[(r, c)] = scale(base, level)
         apply(changes)
+        if f in BASIC:
+            selected.clear()           # Farbe gewählt -> fertig
+            deselect_at = None
+        else:
+            deselect_at = time.monotonic() + DESELECT_AFTER   # mehrmals drücken möglich
 
     last_warn = time.monotonic() - 25
     last_check = 0
     while True:
         try:
             for i in lp.presses():
+                if (i in box_at or i in line_at) and deselect_at:
+                    selected.clear()           # neue Auswahl beginnt
+                    deselect_at = None
                 if i in box_at:
                     selected ^= {box_at[i]}
                 elif i in line_at:
@@ -276,6 +289,9 @@ def main():
                     on_function(func_at[i], chef.state)
 
             now = time.monotonic()
+            if deselect_at and now >= deselect_at:
+                selected.clear()
+                deselect_at = None
             if now - last_check >= 2:
                 last_check = now
                 if not lp.still_there():   # neu eingesteckt -> Dienst startet neu und verbindet sich
