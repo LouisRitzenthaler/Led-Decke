@@ -1,5 +1,5 @@
 // Speichert die App auf dem Handy, damit sie auch ohne Internet startet.
-const CACHE = "led-decke-v1";
+const CACHE = "led-decke-v2";
 const FILES = ["./", "index.html", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png"];
 self.addEventListener("install", (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES))));
 self.addEventListener("activate", (e) => e.waitUntil(

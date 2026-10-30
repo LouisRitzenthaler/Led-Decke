@@ -111,6 +111,17 @@
 </main>
 
 <script>
+// Fehler sichtbar machen, falls ein Browser etwas nicht kann
+window.addEventListener("error", (e) => {
+  const el = document.getElementById("err");
+  if (el) { el.textContent = "Fehler: " + e.message; el.style.display = "block"; }
+});
+</script>
+<script>
+// Alles in einer eigenen Funktion, damit sich nichts mit Namen beißt,
+// die ein Browser wie Bluefy selbst in die Seite einfügt.
+(() => {
+"use strict";
 const SWATCHES = ["#ffd9a0", "#ffffff", "#ff0000", "#ff6a00", "#ffd000", "#00ff40",
                   "#00e0ff", "#0040ff", "#8000ff", "#ff00b0", "#ff4060", "#000000"];
 const $ = (id) => document.getElementById(id);
@@ -391,6 +402,7 @@ if (USE_BLE) {  // leeres Raster anzeigen, bis die Decke verbunden ist
 }
 poll();
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+})();
 </script>
 </body>
 </html>
