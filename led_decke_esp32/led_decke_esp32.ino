@@ -9,6 +9,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <HTTPUpdateServer.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Adafruit_NeoPixel.h>
@@ -124,40 +126,64 @@ void showMyRow() {
   }
 }
 
-// Mit Heim-WLAN: alle ESP32 funken auf dem Kanal des Routers, und Updates
-// gehen über WLAN (ArduinoOTA). Ohne WLAN: fester Kanal ESPNOW_CHANNEL.
+// Mit WLAN: alle ESP32 funken auf dem Kanal des WLANs, und Updates gehen
+// über WLAN (Arduino IDE oder Browser http://IP/update). Ist das WLAN beim
+// Start nicht da, wird alle 10 s neu versucht – Updates gehen dann, sobald es
+// da ist. Ohne eingetragenes WLAN: fester Kanal ESPNOW_CHANNEL.
+char hostName[32];
+WebServer web(80);
+HTTPUpdateServer webUpdater;
+bool otaStarted = false;
+unsigned long lastWifiTry = 0;
+
 void startRadio() {
-  char host[32];
-  snprintf(host, sizeof(host), "%s%d", OTA_HOSTNAME_PREFIX, ROW_NUMBER);
+  snprintf(hostName, sizeof(hostName), "%s%d", OTA_HOSTNAME_PREFIX, ROW_NUMBER);
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname(host);
-  bool online = false;
+  WiFi.setHostname(hostName);
   if (strlen(WIFI_SSID) > 0) {
+    WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.printf("Verbinde mit WLAN \"%s\"", WIFI_SSID);
-    for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
+    for (int i = 0; i < 60 && WiFi.status() != WL_CONNECTED; i++) {
       delay(250);
       Serial.print('.');
     }
-    Serial.println();
-    online = WiFi.status() == WL_CONNECTED;
-  }
-  if (online) {
-    WiFi.setAutoReconnect(true);
-    Serial.printf("WLAN ok: %s, Kanal %d\n", WiFi.localIP().toString().c_str(), WiFi.channel());
-    ArduinoOTA.setHostname(host);
-    if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
-    ArduinoOTA.onStart([] { Serial.println("Update startet ..."); });
-    ArduinoOTA.begin();
-    Serial.printf("Update über WLAN möglich: \"%s\"\n", host);
+    Serial.println(WiFi.status() == WL_CONNECTED ? " verbunden" : " noch nicht da, versuche weiter");
   } else {
-    WiFi.disconnect();
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
     Serial.printf("Ohne WLAN, Funkkanal %d (kein Update über WLAN)\n", ESPNOW_CHANNEL);
   }
   if (esp_now_init() != ESP_OK) Serial.println("ESP-NOW konnte nicht starten!");
+}
+
+// In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
+void handleNetwork() {
+  if (strlen(WIFI_SSID) == 0) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWifiTry > 10000) {
+      lastWifiTry = millis();
+      WiFi.reconnect();
+    }
+    return;
+  }
+  if (!otaStarted) {
+    otaStarted = true;
+    ArduinoOTA.setHostname(hostName);
+    if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.onStart([] { Serial.println("Update startet ..."); });
+    ArduinoOTA.begin();
+    webUpdater.setup(&web);  // Notfall-Update im Browser: http://IP/update
+    web.on("/", [] {
+      web.send(200, "text/plain", String("LED-Decke Reihe ") + ROW_NUMBER + " laeuft");
+    });
+    web.begin();
+    Serial.printf("WLAN ok: http://%s  (Kanal %d), Update-Name \"%s\"\n",
+                  WiFi.localIP().toString().c_str(), WiFi.channel(), hostName);
+  }
+  ArduinoOTA.handle();
+  web.handleClient();
 }
 
 #if !IS_MASTER
@@ -194,7 +220,7 @@ void setup() {
 }
 
 void loop() {
-  ArduinoOTA.handle();
+  handleNetwork();
   if (rxNew) {
     portENTER_CRITICAL(&rxMux);
     memcpy(frame, rxPacket.frame, sizeof(frame));
@@ -521,7 +547,7 @@ void setup() {
 
 void loop() {
   static unsigned long lastFrame = 0;
-  ArduinoOTA.handle();
+  handleNetwork();
   unsigned long now = millis();
   if (now - lastFrame >= 1000 / FPS) {
     {

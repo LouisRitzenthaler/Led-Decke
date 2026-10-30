@@ -52,8 +52,8 @@
    **Adafruit NeoPixel**, **ArduinoJson** und **NimBLE-Arduino** installieren.
 4. `led_decke_esp32/led_decke_esp32.ino` öffnen.
 5. *Werkzeuge*: Board **ESP32 Dev Module**, Partition Scheme
-   **Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)** (nicht ändern!
-   Über WLAN lässt sich die Aufteilung nicht umstellen), richtigen Port wählen.
+   **Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**. So ist Reihe 1
+   schon eingerichtet. Nie umstellen, über WLAN lässt sich das nicht ändern, richtigen Port wählen.
 6. In `config.h` dein WLAN eintragen (`WIFI_SSID`, `WIFI_PASSWORD`).
    Das brauchst du für Updates ohne Kabel, siehe unten.
 7. Für jeden der 7 ESP32:
@@ -69,6 +69,11 @@ Im *Seriellen Monitor* (115200 Baud) meldet sich jeder ESP32 mit seiner Reihe.
 Reihe 1 hängt schon mit dem Testcode an der Decke, der ebenfalls Updates über
 WLAN kann. Deshalb kannst du diese Firmware direkt über WLAN aufspielen
 (Tools → Port → Netzwerk-Port der Reihe 1), ohne sie abzunehmen.
+
+Notfall-Weg, falls der Netzwerk-Port nicht erscheint: **Sketch → Export
+Compiled Binary**, dann im Browser `http://IP-des-ESP32/update` öffnen und die
+`.bin`-Datei aus dem Ordner `build` hochladen. Lädt der Upload nicht („No
+response from device“), die Windows-Firewall kurz ausschalten.
 
 Wenn das WLAN in `config.h` steht, kannst du später neue Firmware aufspielen,
 ohne die ESP32 abzunehmen:
