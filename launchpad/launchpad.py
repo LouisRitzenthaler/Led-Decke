@@ -4,8 +4,9 @@
 Belegung (Spalten 1-9 von links, Reihen a-i von oben, a = obere runde Tasten):
   - 1-7 / a-i   = die 7x9 Kästen. Drücken: blinkt = ausgewählt, nochmal: abgewählt
   - Spalte 8    = 9 Farben (a Rot ... i Weiß) für die ausgewählten Kästen
-  - 9b / 9c     = Helligkeit + / - (ausgewählte Kästen, ohne Auswahl die ganze Decke)
-  - 9d - 9i     = Effekte. Nochmal drücken = Effekt aus
+  - 9b / 9c     = An / Aus (ausgewählte Kästen, ohne Auswahl die ganze Decke)
+  - 9d / 9e     = Helligkeit + / - (ausgewählte Kästen, ohne Auswahl die ganze Decke)
+  - 9f - 9i     = Effekte. Nochmal drücken = Effekt aus
 
 Nach einer Farbe ist die Auswahl sofort weg, nach Helligkeit 2,5 s nach dem
 letzten Drücken (so kann man mehrmals drücken).
@@ -36,9 +37,9 @@ DESELECT_AFTER = 2.5                   # Auswahl endet so viele Sekunden nach He
 # Spalte 8, von a bis i
 COLORS = [(255, 0, 0), (255, 90, 0), (255, 210, 0), (0, 255, 0), (0, 255, 200),
           (0, 0, 255), (140, 0, 255), (255, 0, 140), (255, 255, 255)]
-# Spalte 9, von d bis i: (Name im ESP32, Farbe der Taste)
+# Spalte 9, von f bis i: (Name im ESP32, Farbe der Taste)
 EFFECTS = [("rainbow", (255, 0, 255)), ("colorfade", (0, 255, 255)), ("wave", (0, 80, 255)),
-           ("breathe", (255, 90, 0)), ("sparkle", (255, 255, 255)), ("rain", (0, 160, 255))]
+           ("sparkle", (255, 255, 255))]
 # Reihenfolge der Effekte im ESP32 (für die Nummer im Zustand)
 ESP_EFFECTS = ["rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test"]
 
@@ -305,10 +306,12 @@ def main():
         for c in range(COLS):
             box_at[lp.led_index(c + 1, y)] = (r, c)
         color_at[lp.led_index(8, y)] = COLORS[r]
-    func_at[lp.led_index(9, 8)] = "bri+"
-    func_at[lp.led_index(9, 7)] = "bri-"
+    func_at[lp.led_index(9, 8)] = "on"
+    func_at[lp.led_index(9, 7)] = "off"
+    func_at[lp.led_index(9, 6)] = "bri+"
+    func_at[lp.led_index(9, 5)] = "bri-"
     for k, (name, _) in enumerate(EFFECTS):
-        func_at[lp.led_index(9, 6 - k)] = name
+        func_at[lp.led_index(9, 4 - k)] = name
     effect_color = dict(EFFECTS)
 
     def apply(d, changes):
@@ -334,13 +337,42 @@ def main():
             apply(d, {(r, c): scale(col, split(st["boxes"][r][c])[1] or 1.0) for r, c in selected})
         selected.clear()
 
+    saved = {}                # Kästen vor "Alles aus", für "Alles an"
+
+    def on_off(d, st, on):
+        nonlocal saved
+        boxes = st["boxes"]
+        if selected:
+            changes = {}
+            for r, c in selected:
+                base, level = split(boxes[r][c])
+                if on and base is None:
+                    changes[(r, c)] = remembered.pop((r, c), (255, 255, 255))
+                elif not on and base is not None:
+                    remembered[(r, c)] = boxes[r][c]
+                    changes[(r, c)] = (0, 0, 0)
+            apply(d, changes)
+        elif not on:                   # ganze Decke aus, vorher merken
+            lit = {(r, c): boxes[r][c] for r in range(ROWS) for c in range(COLS) if max(boxes[r][c]) > 0}
+            if lit:
+                saved = lit
+            apply(d, {(r, c): (0, 0, 0) for r in range(ROWS) for c in range(COLS)})
+        else:                          # ganze Decke wieder an (wie vorher, sonst weiß)
+            if any(max(boxes[r][c]) > 0 for r in range(ROWS) for c in range(COLS)):
+                return
+            apply(d, saved or {(r, c): (255, 255, 255) for r in range(ROWS) for c in range(COLS)})
+
     def on_function(f):
         nonlocal deselect_at
         d = deck()
         st = d.state
         if not st:
             return
-        if f in ("bri+", "bri-"):
+        if f in ("on", "off"):
+            on_off(d, st, f == "on")
+            selected.clear()
+            deselect_at = None
+        elif f in ("bri+", "bri-"):
             step = 1 if f == "bri+" else -1
             if not selected:           # ganze Decke heller/dunkler
                 bri = max(0, min(st["max"], st["brightness"] + step * BRIGHTNESS_STEP))
@@ -410,7 +442,11 @@ def main():
                 leds[i] = col
             mode = ESP_EFFECTS[st["mode"]] if st and 0 <= st["mode"] < len(ESP_EFFECTS) else None
             for i, f in func_at.items():
-                if f == "bri+":
+                if f == "on":
+                    leds[i] = (0, 255, 0)
+                elif f == "off":
+                    leds[i] = (255, 0, 0)
+                elif f == "bri+":
                     leds[i] = (255, 255, 255)
                 elif f == "bri-":
                     leds[i] = (40, 40, 40)
