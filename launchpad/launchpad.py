@@ -15,8 +15,10 @@ Launchpad immer die echten Farben der Decke an.
 """
 import colorsys
 import json
+import queue
 import socket
 import sys
+import threading
 import time
 
 import mido
@@ -116,6 +118,21 @@ class Chef:
         self.addr = None
         self.state = None
         self.next_lookup = 0
+        self.online = False
+        self.todo = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def post(self, cmd):
+        """Befehl im Hintergrund schicken – das Launchpad wartet nie auf die Decke."""
+        self.todo.put(cmd)
+
+    def _run(self):
+        while True:
+            try:
+                cmd = self.todo.get(timeout=POLL)
+            except queue.Empty:
+                cmd = {"op": "get"}
+            self.online = self.send(cmd)
 
     def _find(self):
         # Den Namen nur alle 30 s nachschlagen (das kann ein paar Sekunden dauern),
@@ -206,14 +223,18 @@ def main():
         for cell, col in changes.items():
             by_color.setdefault(col, []).append(list(cell))
         for col, cells in by_color.items():
-            chef.send({"op": "boxes", "color": hexcolor(col), "cells": cells})
+            chef.post({"op": "boxes", "color": hexcolor(col), "cells": cells})
+        if chef.state:                 # sofort merken, damit schnelles Drücken nicht verloren geht
+            for (r, c), col in changes.items():
+                chef.state["boxes"][r][c] = col
 
     def on_function(f, st):
         nonlocal last_color
         if not selected:
             if f in ("bri+", "bri-") and st:   # nichts ausgewählt: ganze Decke heller/dunkler
                 step = BRIGHTNESS_STEP if f == "bri+" else -BRIGHTNESS_STEP
-                chef.send({"op": "settings", "brightness": max(0, min(st["max"], st["brightness"] + step))})
+                st["brightness"] = max(0, min(st["max"], st["brightness"] + step))
+                chef.post({"op": "settings", "brightness": st["brightness"]})
             elif f in BASIC:
                 last_color = BASIC[f]
             return
@@ -241,8 +262,7 @@ def main():
                 changes[(r, c)] = scale(base, level)
         apply(changes)
 
-    last_poll = 0
-    last_warn = -100
+    last_warn = time.monotonic() - 25
     last_check = 0
     while True:
         try:
@@ -261,11 +281,9 @@ def main():
                 if not lp.still_there():   # neu eingesteckt -> Dienst startet neu und verbindet sich
                     print("Launchpad abgesteckt, starte neu", flush=True)
                     sys.exit(1)
-            if now - last_poll >= POLL:
-                last_poll = now
-                if not chef.send({"op": "get"}) and chef.state is None and now - last_warn > 30:
-                    last_warn = now
-                    print("Decke antwortet nicht (WLAN an? ESP32 an?)", flush=True)
+            if not chef.online and now - last_warn > 30:
+                last_warn = now
+                print("Decke antwortet nicht (WLAN an? ESP32 an?)", flush=True)
 
             # Launchpad anzeigen: ausgewählte Kästen blinken
             blink_on = int(now * 3) % 2 == 0
