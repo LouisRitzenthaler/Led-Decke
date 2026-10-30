@@ -205,23 +205,22 @@ Preferences prefs;
 bool dirty = false, scenesDirty = false;
 unsigned long lastSave = 0;
 
+// Nach dem Einschalten ist die Decke immer ganz weiß (halbe Helligkeit, kein Effekt).
+// Nur die Szenen, das Tempo und die Effekt-Farbe bleiben gespeichert.
 void loadState() {
   prefs.begin("leddecke", false);
-  if (prefs.getBytesLength("boxes") == sizeof(boxes)) prefs.getBytes("boxes", boxes, sizeof(boxes));
   if (prefs.getBytesLength("scenes") == sizeof(scenes)) prefs.getBytes("scenes", scenes, sizeof(scenes));
-  brightness = constrain(prefs.getInt("bri", brightness), 0, MAX_BRIGHTNESS);
   speed = constrain(prefs.getFloat("spd", 1.0), 0.1f, 5.0f);
   fxColor = CRGB(prefs.getUInt("col", 0xff6a00));
-  mode = prefs.getInt("mode", -1);
-  if (mode < -1 || mode >= NUM_EFFECTS || mode == WIRING_TEST) mode = -1;
+  for (int r = 0; r < ROWS; r++)
+    for (int c = 0; c < COLS; c++) boxes[r][c] = WHITE;
+  brightness = MAX_BRIGHTNESS / 2;
+  mode = -1;
 }
 
 void saveState() {
-  prefs.putBytes("boxes", boxes, sizeof(boxes));
-  prefs.putInt("bri", brightness);
   prefs.putFloat("spd", speed);
   prefs.putUInt("col", ((uint32_t)fxColor.r << 16) | (fxColor.g << 8) | fxColor.b);
-  prefs.putInt("mode", mode);
   if (scenesDirty) {
     prefs.putBytes("scenes", scenes, sizeof(scenes));
     scenesDirty = false;

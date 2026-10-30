@@ -12,14 +12,13 @@ Nach einer Farbe ist die Auswahl sofort weg, nach Helligkeit 2,5 s nach dem
 letzten Drücken (so kann man mehrmals drücken).
 Der Pi schickt die Befehle per Bluetooth an den ESP32 (ohne WLAN, ohne Internet)
 und zeigt auf dem Launchpad die echten Farben der Decke. Fehlt das Bluetooth-Paket
-(bleak), nimmt er das WLAN (UDP). Antwortet keine Decke, spielt das
-Programm die Decke nach (Testmodus), damit man das Launchpad ausprobieren kann.
+(bleak), nimmt er das WLAN (UDP). Solange die Decke nicht verbunden ist, blinken
+die Kästen auf dem Launchpad langsam blau und Tasten tun nichts. Danach zeigt
+es genau das, was die Decke gerade macht.
 """
-import colorsys
 import json
 import math
 import queue
-import random
 import socket
 import sys
 import threading
@@ -142,6 +141,7 @@ class Chef:
         self.state = None
         self.online = False
         self.ever_online = False
+        self.last_ok = 0
         self.todo = queue.Queue()
         threading.Thread(target=self._run, daemon=True).start()
         threading.Thread(target=self._lookup, daemon=True).start()
@@ -195,7 +195,12 @@ class Chef:
         self.misses = 0
         self.addr = (sender[0], UDP_PORT)
         self.state = parse_state(data)
+        self.last_ok = time.monotonic()
         return True
+
+    def synced(self):
+        """True, wenn die Decke in den letzten 3 s ihren Zustand geschickt hat."""
+        return self.state is not None and time.monotonic() - self.last_ok < 3
 
 
 class BleChef:
@@ -205,6 +210,7 @@ class BleChef:
         self.state = None
         self.online = False
         self.ever_online = False
+        self.last_ok = 0
         self.todo = queue.Queue()
         self.pending = None
         threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True).start()
@@ -223,14 +229,23 @@ class BleChef:
                     continue
                 async with BleakClient(dev) as client:
                     print("Decke per Bluetooth verbunden", flush=True)
+                    while not self.todo.empty():   # alte Tasten von vor der Verbindung vergessen
+                        self.todo.get_nowait()
+                    self.pending = None
                     await self._talk(client)
             except Exception as e:     # Bluetooth-Fehler: kurz warten, neu verbinden
                 print("Bluetooth:", e, flush=True)
             self.online = False
+            self.last_ok = 0
             await asyncio.sleep(1)
 
+    def synced(self):
+        """True, wenn die Decke in den letzten 3 s ihren Zustand geschickt hat."""
+        return self.state is not None and time.monotonic() - self.last_ok < 3
+
     async def _talk(self, client):
-        last_read = 0
+        await self._read(client)             # zuerst den Zustand der Decke holen
+        last_read = time.monotonic()
         while client.is_connected:
             if self.pending is None:
                 try:
@@ -244,13 +259,19 @@ class BleChef:
                 continue
             if time.monotonic() - last_read >= POLL:
                 last_read = time.monotonic()
-                data = bytes(await client.read_gatt_char(BLE_STATE))
-                st = parse_state(data)
-                if st:
-                    self.state = st
-                    self.online = self.ever_online = True
+                await self._read(client)
             else:
                 await asyncio.sleep(0.01)
+
+    async def _read(self, client):
+        data = bytes(await client.read_gatt_char(BLE_STATE))
+        st = parse_state(data)
+        if st is None:
+            print("Zustand der Decke unlesbar (%d Bytes)" % len(data), flush=True)
+            return
+        self.state = st
+        self.last_ok = time.monotonic()
+        self.online = self.ever_online = True
 
 
 def parse_state(data):
@@ -278,7 +299,7 @@ def dim(c, f):
 
 
 # ---------------------------------------------------------------------
-#  Hauptprogramm
+#  Farben umrechnen
 # ---------------------------------------------------------------------
 def split(c):
     """Farbe -> (Grundfarbe in voller Helligkeit, Helligkeit 0..1)."""
@@ -302,81 +323,6 @@ def on_pad(c, level):
     return tuple(math.ceil(round(top * v / m) * 255 / 63) for v in c)
 
 
-def hsv(h, s=1.0, v=1.0):
-    return tuple(int(x * 255) for x in colorsys.hsv_to_rgb(h % 1, s, v))
-
-
-# ---------------------------------------------------------------------
-#  Testmodus: spielt die Decke nach, solange kein ESP32 antwortet
-# ---------------------------------------------------------------------
-class SimDecke:
-    def __init__(self):
-        self.online = True
-        self.boxes = [[(0, 0, 0)] * COLS for _ in range(ROWS)]
-        self.mode = -1
-        self.brightness = MAX_BRIGHTNESS // 2
-        self.fx = (255, 106, 0)
-        self.spark = {}
-        self.drops = [[-10.0, 0.0] for _ in range(COLS)]
-        self.t0 = time.monotonic()
-
-    def post(self, cmd):
-        op = cmd.get("op")
-        if op == "boxes":
-            col = tuple(int(cmd["color"][i:i + 2], 16) for i in (1, 3, 5))
-            for r, c in cmd["cells"]:
-                self.boxes[r][c] = col
-            self.mode = -1
-        elif op == "fill":
-            col = tuple(int(cmd["color"][i:i + 2], 16) for i in (1, 3, 5))
-            self.boxes = [[col] * COLS for _ in range(ROWS)]
-            self.mode = -1
-        elif op == "settings":
-            if "brightness" in cmd:
-                self.brightness = max(0, min(MAX_BRIGHTNESS, cmd["brightness"]))
-            if "color" in cmd:
-                self.fx = tuple(int(cmd["color"][i:i + 2], 16) for i in (1, 3, 5))
-            if "mode" in cmd:
-                self.mode = ESP_EFFECTS.index(cmd["mode"]) if cmd["mode"] in ESP_EFFECTS else -1
-
-    def _frame(self):
-        t = time.monotonic() - self.t0
-        m = self.mode
-        if m < 0:
-            return [row[:] for row in self.boxes]
-        f = [[(0, 0, 0)] * COLS for _ in range(ROWS)]
-        for r in range(ROWS):
-            for c in range(COLS):
-                if m == 0:
-                    f[r][c] = hsv(t * 0.1 + (r + c) / (ROWS + COLS))
-                elif m == 1:
-                    f[r][c] = hsv(t * 0.05)
-                elif m == 2:
-                    f[r][c] = scale(self.fx, 0.08 + 0.92 * (math.sin(r * 0.8 - t * 2.5) + 1) / 2)
-                elif m == 3:
-                    f[r][c] = scale(self.fx, 0.05 + 0.95 * (math.sin(t * 1.5) + 1) / 2)
-        if m == 4:
-            if random.random() < 0.5:
-                self.spark[(random.randrange(ROWS), random.randrange(COLS))] = (t, random.random())
-            self.spark = {k: v for k, v in self.spark.items() if t - v[0] < 1.5}
-            for (r, c), (start, h) in self.spark.items():
-                f[r][c] = hsv(h, 0.6, 1 - (t - start) / 1.5)
-        if m == 5:
-            for c, d in enumerate(self.drops):
-                if t - d[0] > d[1]:
-                    d[0], d[1] = t - random.random(), ROWS / 4 + random.random() * 2
-                head = (t - d[0]) * 4
-                for r in range(ROWS):
-                    if 0 <= head - r < 4:
-                        f[r][c] = scale(self.fx, 1 - (head - r) / 4)
-        return f
-
-    @property
-    def state(self):
-        return {"mode": self.mode, "brightness": self.brightness, "max": MAX_BRIGHTNESS,
-                "boxes": self.boxes, "frame": self._frame()}
-
-
 # ---------------------------------------------------------------------
 #  Hauptprogramm
 # ---------------------------------------------------------------------
@@ -390,14 +336,12 @@ def main():
             time.sleep(5)
 
     chef = BleChef() if BleakClient else Chef()
-    sim = SimDecke()
     selected = set()          # ausgewählte Kästen (blinken)
     remembered = {}           # Grundfarbe von Kästen, die per Helligkeit ganz aus sind
     deselect_at = None        # Zeitpunkt, an dem die Auswahl nach Helligkeit endet
 
     def deck():
-        """Die echte Decke, sobald sie einmal geantwortet hat, sonst der Testmodus."""
-        return chef if chef.ever_online else sim
+        return chef
 
     # Tasten-Index -> was sie tun. Reihe a = obere Tasten (y=9), i = unten (y=1)
     box_at, color_at, func_at = {}, {}, {}
@@ -512,6 +456,8 @@ def main():
     while True:
         try:
             for i in lp.presses():
+                if not chef.synced():
+                    continue
                 if i in box_at:
                     if deselect_at:            # nach Helligkeit: neue Auswahl beginnt
                         selected.clear()
@@ -532,9 +478,17 @@ def main():
                 if not lp.still_there():   # neu eingesteckt -> Dienst startet neu und verbindet sich
                     print("Launchpad abgesteckt, starte neu", flush=True)
                     sys.exit(1)
-            if not chef.ever_online and now - last_warn > 30:
-                last_warn = now
-                print("Keine Decke gefunden – Testmodus (Launchpad spielt die Decke nach)", flush=True)
+            if not chef.synced():          # warten, bis die Decke ihren Zustand geschickt hat
+                if now - last_warn > 30:
+                    last_warn = now
+                    print("Warte auf die Decke ...", flush=True)
+                selected.clear()
+                deselect_at = None
+                wait = (0, 0, 40) if int(now) % 2 == 0 else (0, 0, 0)
+                lp.show({**{i: wait for i in box_at}, **{i: (0, 0, 0) for i in color_at},
+                         **{i: (0, 0, 0) for i in func_at}})
+                time.sleep(0.05)
+                continue
 
             # Launchpad anzeigen: Farben der Decke (mit Helligkeit), Auswahl blinkt
             blink_on = int(now * 3) % 2 == 0
