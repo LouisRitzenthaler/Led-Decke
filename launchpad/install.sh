@@ -13,6 +13,15 @@ echo "== Pakete installieren =="
 sudo apt-get update -q
 sudo apt-get install -y python3-mido python3-rtmidi avahi-daemon libnss-mdns
 
+# Das WLAN, in dem der Pi gerade ist (der Hotspot), beim Start bevorzugen
+if command -v nmcli > /dev/null; then
+  WLAN="$(nmcli -t -f NAME,TYPE connection show --active | grep ':802-11-wireless$' | head -1 | cut -d: -f1)"
+  if [ -n "$WLAN" ]; then
+    sudo nmcli connection modify "$WLAN" connection.autoconnect-priority 10 || true
+    echo "WLAN \"$WLAN\" wird beim Start bevorzugt"
+  fi
+fi
+
 echo "== Programm herunterladen =="
 mkdir -p "$DIR"
 curl -sSL "$BASE/launchpad.py" -o "$DIR/launchpad.py"
