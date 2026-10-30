@@ -136,6 +136,7 @@ void showAll() {
 WebServer web(80);
 HTTPUpdateServer webUpdater;
 bool otaStarted = false;
+void bluetoothPause(bool pause);
 unsigned long lastWifiTry = 0;
 
 void startWifi() {
@@ -164,7 +165,9 @@ void handleNetwork() {
     otaStarted = true;
     ArduinoOTA.setHostname(HOSTNAME);
     if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
-    ArduinoOTA.onStart([] { Serial.println("Update startet ..."); });
+    // Während des Updates Bluetooth trennen, sonst bricht das Update ab
+    ArduinoOTA.onStart([] { Serial.println("Update startet ..."); bluetoothPause(true); });
+    ArduinoOTA.onError([](ota_error_t) { bluetoothPause(false); });
     ArduinoOTA.begin();
     webUpdater.setup(&web);  // Notfall-Update im Browser: http://IP/update
     web.on("/", [] { web.send(200, "text/plain", "LED-Decke laeuft"); });
@@ -456,6 +459,18 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     if (srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) NimBLEDevice::startAdvertising();
   }
 };
+
+void bluetoothPause(bool pause) {
+  NimBLEServer *srv = NimBLEDevice::getServer();
+  if (!srv) return;
+  srv->advertiseOnDisconnect(!pause);
+  if (pause) {
+    NimBLEDevice::stopAdvertising();
+    for (uint16_t h : srv->getPeerDevices()) srv->disconnect(h);
+  } else {
+    NimBLEDevice::startAdvertising();
+  }
+}
 
 void startBle() {
   NimBLEDevice::init(BLE_NAME);
