@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111318">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>LED-Decke</title>
+<style>
+  :root {
+    --bg: #111318; --panel: #1b1e26; --line: #2c303b; --text: #eef0f4;
+    --muted: #9097a6; --accent: #ffb347;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 520px; margin: 0 auto; padding: 12px 16px 40px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    margin: 0 0 10px; font-weight: 600; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px; margin-bottom: 12px; }
+  button { font: inherit; color: var(--text); background: #262a35; border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; cursor: pointer; }
+  button:active { transform: scale(.97); }
+  button.on { background: var(--accent); color: #1a1200; border-color: var(--accent); font-weight: 600; }
+  #power { background: #3a1d1d; border-color: #5a2a2a; }
+
+  #grid { display: grid; grid-template-columns: repeat(var(--cols), 1fr); gap: 5px;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  .cell { aspect-ratio: 1; border-radius: 6px; border: 1px solid rgba(255,255,255,.08);
+    background: #000; transition: background-color .12s; }
+  #grid.live .cell { transition: none; }
+  #hint { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
+
+  .swatches { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 12px; }
+  .sw { aspect-ratio: 1; border-radius: 50%; border: 2px solid transparent; padding: 0; }
+  .sw.sel { border-color: #fff; box-shadow: 0 0 0 2px var(--bg) inset; }
+  .sw.off { background: #000 !important; position: relative; }
+  .sw.off::after { content: "aus"; position: absolute; inset: 0; display: grid; place-items: center;
+    font-size: 11px; color: var(--muted); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; }
+  input[type=color] { flex: 0 0 52px; height: 44px; border: 1px solid var(--line); border-radius: 10px;
+    background: none; padding: 2px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
+  label { display: block; font-size: 14px; color: var(--muted); margin-top: 6px; }
+  label span { float: right; color: var(--text); }
+  .fx { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 8px 10px; }
+  .chip .x { color: var(--muted); padding-left: 4px; }
+  #ble { display: none; }
+  #ble p { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
+  #ble button { width: 100%; }
+  #err { display: none; background: #5a2a2a; padding: 10px 12px; border-radius: 10px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>LED-Decke</h1>
+    <button id="power">Alles aus</button>
+  </header>
+  <div id="err">Keine Verbindung zur Decke …</div>
+  <section id="ble">
+    <p id="bleStatus">Nicht verbunden.</p>
+    <button id="bleConnect" class="on">Mit Bluetooth verbinden</button>
+  </section>
+
+  <section>
+    <div id="grid"></div>
+    <p id="hint">Tippen oder wischen, um Kästen zu färben.</p>
+  </section>
+
+  <section>
+    <h2>Farbe</h2>
+    <div class="swatches" id="swatches"></div>
+    <div class="row">
+      <input type="color" id="picker" value="#ff6a00">
+      <button id="fill">Alle in dieser Farbe</button>
+    </div>
+    <label>Helligkeit <span id="bval"></span></label>
+    <input type="range" id="bright" min="0" max="255" value="80">
+  </section>
+
+  <section>
+    <h2>Effekte</h2>
+    <div class="fx" id="fx">
+      <button data-mode="static">Eigenes Muster</button>
+    </div>
+    <label>Tempo <span id="sval"></span></label>
+    <input type="range" id="speed" min="0.1" max="5" step="0.1" value="1">
+  </section>
+
+  <section>
+    <h2>Szenen</h2>
+    <div class="chips" id="scenes"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="saveScene">Aktuelles Muster speichern</button>
+    </div>
+  </section>
+</main>
+
+<script>
+const SWATCHES = ["#ffd9a0", "#ffffff", "#ff0000", "#ff6a00", "#ffd000", "#00ff40",
+                  "#00e0ff", "#0040ff", "#8000ff", "#ff00b0", "#ff4060", "#000000"];
+const $ = (id) => document.getElementById(id);
+let S = null;          // letzter Zustand vom Pi
+let color = "#ff6a00";
+let pending = new Map();
+let painting = false, lastCell = null;
+
+// Diese Seite steuert die Decke per Bluetooth (Web Bluetooth).
+const USE_BLE = true;
+
+async function api(method, url, body) {
+  if (USE_BLE) {
+    try {
+      const s = await bleApi(method, url, body);
+      $("err").style.display = "none";
+      return s;
+    } catch (e) {
+      if (ble) { $("err").textContent = "Bluetooth-Fehler: " + e.message; $("err").style.display = "block"; }
+      return null;
+    }
+  }
+  try {
+    const r = await fetch(url, { method, headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined });
+    if (!r.ok) throw new Error(r.status);
+    $("err").style.display = "none";
+    return await r.json();
+  } catch (e) {
+    $("err").style.display = "block";
+    return null;
+  }
+}
+
+// --- Bluetooth (nur ESP32) --------------------------------------------------
+// Die UUIDs müssen zu led_decke_esp32.ino passen.
+const UUID = {
+  svc: "6e1d0001-8a3c-4c5b-9b1e-1ed0c0dec0de",
+  cmd: "6e1d0002-8a3c-4c5b-9b1e-1ed0c0dec0de",
+  state: "6e1d0003-8a3c-4c5b-9b1e-1ed0c0dec0de",
+  scenes: "6e1d0004-8a3c-4c5b-9b1e-1ed0c0dec0de",
+};
+const EFFECTS = [["rainbow", "Regenbogen"], ["colorfade", "Farbwechsel"], ["wave", "Welle"],
+  ["breathe", "Atmen"], ["sparkle", "Funkeln"], ["rain", "Regen"], ["wiring_test", "Verkabelungstest"]]
+  .map(([id, name]) => ({ id, name }));
+let ble = null, sceneNames = [], bleChain = Promise.resolve();
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// Bluetooth kann nur eine Sache gleichzeitig: alles nacheinander abarbeiten.
+function bleOp(fn) {
+  const p = bleChain.then(fn);
+  bleChain = p.catch(() => {});
+  return p;
+}
+const bleWrite = (obj) => ble.cmd.writeValueWithResponse(enc.encode(JSON.stringify(obj)));
+async function bleReadScenes() { sceneNames = JSON.parse(dec.decode(await ble.scenes.readValue())); }
+async function bleReadState() {
+  const v = await ble.state.readValue();
+  const hex = (o) => "#" + [0, 1, 2].map((i) => v.getUint8(o + i).toString(16).padStart(2, "0")).join("");
+  const rows = v.getUint8(8), cols = v.getUint8(9), n = rows * cols * 3;
+  const grid = (base) => Array.from({ length: rows }, (_, r) =>
+    Array.from({ length: cols }, (_, c) => hex(base + (r * cols + c) * 3)));
+  const m = v.getInt8(1);
+  return { rows, cols, boxes: grid(10), frame: grid(10 + n), mode: m < 0 ? "static" : EFFECTS[m].id,
+    brightness: v.getUint8(2), max_brightness: v.getUint8(3), speed: v.getUint8(4) / 10,
+    color: hex(5), effects: EFFECTS, scenes: [...sceneNames].sort() };
+}
+function bleApi(method, url, body) {
+  if (!ble) return Promise.reject(new Error("nicht verbunden"));
+  return bleOp(async () => {
+    if (url === "/api/boxes") {
+      for (let i = 0; i < body.cells.length; i += 20)
+        await bleWrite({ op: "boxes", color: body.color, cells: body.cells.slice(i, i + 20) });
+    } else if (url === "/api/fill" || url === "/api/settings") {
+      await bleWrite({ op: url.slice(5), ...body });
+    } else if (url.startsWith("/api/scenes/")) {
+      const op = { POST: "scene_save", PUT: "scene_load", DELETE: "scene_delete" }[method];
+      await bleWrite({ op, name: decodeURIComponent(url.slice(12)) });
+      await bleReadScenes();
+    }
+    return bleReadState();
+  });
+}
+function bleStatus(text, showButton) {
+  $("bleStatus").textContent = text;
+  $("bleConnect").style.display = showButton ? "" : "none";
+}
+async function bleAttach(device) {
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(UUID.svc);
+  const c = {};
+  for (const k of ["cmd", "state", "scenes"]) c[k] = await svc.getCharacteristic(UUID[k]);
+  ble = { device, ...c };
+  await bleReadScenes();
+  update(await bleApi("GET", "/api/state"));
+  bleStatus("Verbunden mit „" + (device.name || "LED-Decke") + "“.", false);
+}
+async function bleReconnect(device) {
+  ble = null;
+  for (let i = 0; i < 5; i++) {
+    bleStatus("Verbindung verloren – verbinde neu …", false);
+    try { await bleAttach(device); return; } catch (e) { await new Promise((r) => setTimeout(r, 1500)); }
+  }
+  bleStatus("Verbindung verloren.", true);
+}
+if (USE_BLE) {
+  $("ble").style.display = "block";
+  $("err").textContent = "Nicht verbunden.";
+  if (!navigator.bluetooth) {
+    bleStatus("Dieser Browser kann kein Bluetooth. Android: Chrome benutzen. iPhone/iPad: die kostenlose App „Bluefy“ benutzen.", false);
+  }
+  $("bleConnect").onclick = async () => {
+    try {
+      const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [UUID.svc] }] });
+      device.addEventListener("gattserverdisconnected", () => bleReconnect(device));
+      bleStatus("Verbinde …", false);
+      await bleAttach(device);
+    } catch (e) {
+      ble = null;
+      bleStatus(e.name === "NotFoundError" ? "Keine Decke ausgewählt." : "Verbinden fehlgeschlagen: " + e.message, true);
+    }
+  };
+}
+
+function setColor(c) {
+  color = c;
+  $("picker").value = c;
+  document.querySelectorAll(".sw").forEach((b) => b.classList.toggle("sel", b.dataset.c === c));
+}
+
+function buildGrid() {
+  const g = $("grid");
+  g.style.setProperty("--cols", S.cols);
+  g.innerHTML = "";
+  for (let r = 0; r < S.rows; r++)
+    for (let c = 0; c < S.cols; c++) {
+      const d = document.createElement("div");
+      d.className = "cell"; d.dataset.r = r; d.dataset.c = c;
+      g.appendChild(d);
+    }
+}
+
+function render() {
+  if (!S) return;
+  if ($("grid").children.length !== S.rows * S.cols) buildGrid();
+  const live = S.mode !== "static";
+  const src = live ? S.frame : S.boxes;
+  $("grid").classList.toggle("live", live);
+  [...$("grid").children].forEach((d) => {
+    const key = d.dataset.r + "," + d.dataset.c;
+    d.style.backgroundColor = pending.has(key) ? pending.get(key) : src[d.dataset.r][d.dataset.c];
+  });
+  $("hint").textContent = live
+    ? "Effekt läuft – tippe auf einen Kasten, um zu deinem Muster zurückzukehren."
+    : "Tippen oder wischen, um Kästen zu färben.";
+
+  const fx = $("fx");
+  if (fx.children.length === 1) {
+    S.effects.forEach((e) => {
+      const b = document.createElement("button");
+      b.dataset.mode = e.id; b.textContent = e.name;
+      fx.appendChild(b);
+    });
+  }
+  fx.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.mode === S.mode));
+
+  const br = $("bright");
+  br.max = S.max_brightness;
+  if (document.activeElement !== br) br.value = S.brightness;
+  $("bval").textContent = Math.round(S.brightness / S.max_brightness * 100) + " %";
+  if (document.activeElement !== $("speed")) $("speed").value = S.speed;
+  $("sval").textContent = Number(S.speed).toFixed(1) + "×";
+
+  const sc = $("scenes");
+  sc.innerHTML = S.scenes.length ? "" : '<span style="color:var(--muted);font-size:14px">Noch keine gespeichert.</span>';
+  S.scenes.forEach((name) => {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.innerHTML = `<span></span><span class="x" title="löschen">✕</span>`;
+    b.firstChild.textContent = name;
+    b.onclick = async (ev) => {
+      if (ev.target.classList.contains("x")) {
+        if (confirm(`Szene „${name}“ löschen?`)) update(await api("DELETE", "/api/scenes/" + encodeURIComponent(name)));
+      } else update(await api("PUT", "/api/scenes/" + encodeURIComponent(name)));
+    };
+    sc.appendChild(b);
+  });
+}
+
+function update(s) { if (s) { S = s; render(); } }
+
+// --- Malen ---------------------------------------------------------------
+function cellAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  return el && el.classList.contains("cell") ? el : null;
+}
+function paint(el) {
+  if (!el) return;
+  const key = el.dataset.r + "," + el.dataset.c;
+  if (key === lastCell) return;
+  lastCell = key;
+  pending.set(key, color);
+  el.style.backgroundColor = color;
+}
+let flushTimer = null;
+async function flush() {
+  flushTimer = null;
+  if (!pending.size) return;
+  const batch = new Map(pending);
+  const cells = [...batch.keys()].map((k) => k.split(",").map(Number));
+  const s = await api("POST", "/api/boxes", { color, cells });
+  batch.forEach((v, k) => { if (pending.get(k) === v) pending.delete(k); });
+  update(s);
+}
+function scheduleFlush() { if (!flushTimer) flushTimer = setTimeout(flush, 60); }
+
+const grid = $("grid");
+grid.addEventListener("pointerdown", (e) => {
+  painting = true; lastCell = null;
+  if (S && S.mode !== "static") { S.mode = "static"; render(); }
+  paint(cellAt(e.clientX, e.clientY)); scheduleFlush();
+});
+grid.addEventListener("pointermove", (e) => {
+  if (!painting) return;
+  paint(cellAt(e.clientX, e.clientY)); scheduleFlush();
+});
+window.addEventListener("pointerup", () => { painting = false; lastCell = null; });
+window.addEventListener("pointercancel", () => { painting = false; lastCell = null; });
+
+// --- Bedienelemente --------------------------------------------------------
+SWATCHES.forEach((c) => {
+  const b = document.createElement("button");
+  b.className = "sw" + (c === "#000000" ? " off" : "");
+  b.dataset.c = c; b.style.background = c;
+  b.onclick = () => { setColor(c); if (S && S.mode !== "static") api("POST", "/api/settings", { color: c }).then(update); };
+  $("swatches").appendChild(b);
+});
+$("picker").addEventListener("input", (e) => setColor(e.target.value));
+$("picker").addEventListener("change", (e) => {
+  if (S && S.mode !== "static") api("POST", "/api/settings", { color: e.target.value }).then(update);
+});
+$("fill").onclick = async () => update(await api("POST", "/api/fill", { color }));
+$("power").onclick = async () => update(await api("POST", "/api/fill", { color: "#000000" }));
+
+let brTimer = null;
+$("bright").addEventListener("input", (e) => {
+  $("bval").textContent = Math.round(e.target.value / e.target.max * 100) + " %";
+  clearTimeout(brTimer);
+  brTimer = setTimeout(() => api("POST", "/api/settings", { brightness: +e.target.value }).then(update), 80);
+});
+let spTimer = null;
+$("speed").addEventListener("input", (e) => {
+  $("sval").textContent = Number(e.target.value).toFixed(1) + "×";
+  clearTimeout(spTimer);
+  spTimer = setTimeout(() => api("POST", "/api/settings", { speed: +e.target.value }).then(update), 80);
+});
+$("fx").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  update(await api("POST", "/api/settings", { mode: b.dataset.mode, color }));
+});
+$("saveScene").onclick = async () => {
+  const name = (prompt("Name der Szene:") || "").trim();
+  if (name) update(await api("POST", "/api/scenes/" + encodeURIComponent(name)));
+};
+
+// --- Abgleich mit dem Pi (auch wenn mehrere Handys steuern) ----------------
+async function poll() {
+  if ((!USE_BLE || ble) && !painting && !pending.size && !flushTimer) update(await api("GET", "/api/state"));
+  const live = S && S.mode !== "static";
+  setTimeout(poll, live ? (USE_BLE ? 300 : 150) : 2000);
+}
+setColor(color);
+if (USE_BLE) {  // leeres Raster anzeigen, bis die Decke verbunden ist
+  const off = Array.from({ length: 9 }, () => Array(7).fill("#000000"));
+  update({ rows: 9, cols: 7, boxes: off, frame: off, mode: "static", brightness: 80, max_brightness: 160,
+    speed: 1, color, effects: EFFECTS, scenes: [] });
+}
+poll();
+</script>
+</body>
+</html>
