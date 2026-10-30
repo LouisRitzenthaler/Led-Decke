@@ -2,6 +2,7 @@
 # LED-Decke Launchpad auf dem Raspberry Pi einrichten.
 # Aufruf:  curl -sSL https://raw.githubusercontent.com/LouisRitzenthaler/Led-Decke/main/launchpad/install.sh | bash
 set -e
+trap 'echo; echo "FEHLER in Zeile $LINENO - bitte Foto an Claude schicken"' ERR
 
 # Alles in einer Funktion, damit "curl | bash" sicher das ganze Skript liest
 main() {
@@ -10,8 +11,14 @@ DIR="$HOME/led-decke-launchpad"
 USER_NAME="$(whoami)"
 
 echo "== Pakete installieren =="
-sudo apt-get update -q
-sudo apt-get install -y python3-mido python3-rtmidi avahi-daemon libnss-mdns
+sudo apt-get update -q || echo "WARNUNG: apt-get update ging nicht (Internet da?)"
+sudo apt-get install -y avahi-daemon libnss-mdns || true
+if ! sudo apt-get install -y python3-mido python3-rtmidi; then
+  echo "== Pakete nicht gefunden, nehme pip =="
+  sudo apt-get install -y python3-pip libasound2-dev libjack-dev
+  sudo pip3 install mido python-rtmidi --break-system-packages 2>/dev/null || sudo pip3 install mido python-rtmidi
+fi
+python3 -c "import mido, rtmidi" || { echo "FEHLER: mido/rtmidi fehlen"; exit 1; }
 
 # Das WLAN, in dem der Pi gerade ist (der Hotspot), beim Start bevorzugen
 if command -v nmcli > /dev/null; then
