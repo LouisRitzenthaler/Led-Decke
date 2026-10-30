@@ -106,12 +106,18 @@ class Chef:
         self.sock.settimeout(0.3)
         self.addr = None
         self.state = None
+        self.next_lookup = 0
 
     def _find(self):
-        try:
-            return (socket.gethostbyname(CHEF_HOST), UDP_PORT)
-        except OSError:
-            return ("255.255.255.255", UDP_PORT)   # einfach an alle im WLAN
+        # Den Namen nur alle 30 s nachschlagen (das kann ein paar Sekunden dauern),
+        # sonst einfach an alle im WLAN schicken – der ESP32 antwortet trotzdem.
+        if time.monotonic() >= self.next_lookup:
+            self.next_lookup = time.monotonic() + 30
+            try:
+                return (socket.gethostbyname(CHEF_HOST), UDP_PORT)
+            except OSError:
+                pass
+        return ("255.255.255.255", UDP_PORT)
 
     def send(self, cmd):
         """Befehl schicken, Antwort = aktueller Zustand. False, wenn keine Antwort."""
@@ -173,6 +179,7 @@ def main():
         func_at[(8 - k) * 10 + 9] = f
 
     last_poll = 0
+    last_warn = -100
     while True:
         try:
             for i in lp.presses():
@@ -203,9 +210,9 @@ def main():
             now = time.monotonic()
             if now - last_poll >= POLL:
                 last_poll = now
-                if not chef.send({"op": "get"}) and chef.state is None:
-                    print("Decke antwortet nicht (WLAN an? Chef-ESP32 an?)", flush=True)
-                    time.sleep(1)
+                if not chef.send({"op": "get"}) and chef.state is None and now - last_warn > 30:
+                    last_warn = now
+                    print("Decke antwortet nicht (WLAN an? ESP32 an?)", flush=True)
 
             # Launchpad anzeigen
             leds = {}
