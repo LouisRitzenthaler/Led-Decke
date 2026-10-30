@@ -124,7 +124,7 @@ class Chef:
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.settimeout(0.3)
+        self.sock.settimeout(0.8)     # WLAN mit Bluetooth am ESP32 antwortet manchmal langsam
         self.addr = None          # zuletzt bekannte Adresse des ESP32
         self.named = None         # Adresse über den Namen (wird nebenbei gesucht)
         self.misses = 0
@@ -163,6 +163,13 @@ class Chef:
     def send(self, cmd):
         """Befehl schicken, Antwort = aktueller Zustand. False, wenn keine Antwort."""
         addr = self.addr or self.named or ("255.255.255.255", UDP_PORT)
+        self.sock.setblocking(False)          # alte, zu spät gekommene Antworten wegwerfen
+        try:
+            while self.sock.recv(1024):
+                pass
+        except OSError:
+            pass
+        self.sock.settimeout(0.8)
         try:
             self.sock.sendto(json.dumps(cmd, separators=(",", ":")).encode(), addr)
             while True:
@@ -324,7 +331,7 @@ def main():
     for r in range(ROWS):
         y = 9 - r
         for c in range(COLS):
-            box_at[lp.led_index(c + 1, y)] = (r, c)
+            box_at[lp.led_index(c + 1, y)] = (ROWS - 1 - r, COLS - 1 - c)   # Launchpad hängt 180° gedreht zur Decke
         color_at[lp.led_index(8, y)] = COLORS[r]
     func_at[lp.led_index(9, 8)] = "on"
     func_at[lp.led_index(9, 7)] = "off"

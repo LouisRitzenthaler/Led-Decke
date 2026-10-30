@@ -101,6 +101,7 @@ void addLeds() {
 }
 
 CRGB frame[ROWS][COLS];        // aktuelles Bild der ganzen Decke
+void handleUdp();
 uint8_t shownBrightness = 0;
 
 // Der ESP32 schickt die Streifen nacheinander raus. Nach jedem Streifen wird
@@ -121,6 +122,7 @@ void showAll() {
       for (int i = 0; i < boxCount[k][r]; i++) s->setPixelColor(boxFirst[k][r] + i, color);
     }
     s->show();
+    handleUdp();  // Launchpad zwischendurch bedienen, damit es nicht warten muss
     int prev = (k + NUM_STRIPS - 1) % NUM_STRIPS;
     pinMode(strips[prev]->getPin(), OUTPUT);
     digitalWrite(strips[prev]->getPin(), LOW);
