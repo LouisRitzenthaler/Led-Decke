@@ -27,6 +27,14 @@ if ! sudo apt-get install -y python3-bleak; then
   sudo pip3 install bleak --break-system-packages 2>/dev/null || sudo pip3 install bleak
 fi
 python3 -c "import bleak" || { echo "FEHLER: bleak fehlt"; exit 1; }
+# Bluetooth darf nicht abgeschaltet sein (dtoverlay=disable-bt), sonst findet der Pi die Decke nie
+for CFG in /boot/firmware/config.txt /boot/config.txt; do
+  if [ -f "$CFG" ] && grep -q "^dtoverlay=disable-bt" "$CFG"; then
+    sudo sed -i 's/^dtoverlay=disable-bt/#dtoverlay=disable-bt/' "$CFG"
+    echo "Bluetooth war abgeschaltet - jetzt an. Bitte danach: sudo reboot"
+  fi
+done
+sudo apt-get install -y pi-bluetooth || true
 sudo rfkill unblock bluetooth || true
 sudo systemctl enable --now bluetooth || true
 
