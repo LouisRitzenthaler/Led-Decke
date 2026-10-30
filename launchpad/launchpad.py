@@ -10,8 +10,9 @@ Belegung (Spalten 1-9 von links, Reihen a-i von oben, a = obere runde Tasten):
 
 Nach einer Farbe ist die Auswahl sofort weg, nach Helligkeit 2,5 s nach dem
 letzten Drücken (so kann man mehrmals drücken).
-Der Pi schickt die Befehle per WLAN (UDP) an den ESP32 und zeigt auf dem
-Launchpad die echten Farben der Decke. Antwortet keine Decke, spielt das
+Der Pi schickt die Befehle per Bluetooth an den ESP32 (ohne WLAN, ohne Internet)
+und zeigt auf dem Launchpad die echten Farben der Decke. Fehlt das Bluetooth-Paket
+(bleak), nimmt er das WLAN (UDP). Antwortet keine Decke, spielt das
 Programm die Decke nach (Testmodus), damit man das Launchpad ausprobieren kann.
 """
 import colorsys
@@ -26,7 +27,17 @@ import time
 
 import mido
 
-CHEF_HOST = "led-decke-reihe1.local"   # Name des ESP32 im WLAN
+try:
+    import asyncio
+    from bleak import BleakClient, BleakScanner
+except ImportError:
+    BleakClient = None
+
+BLE_NAME = "LED-Decke"                 # Bluetooth-Name des ESP32
+BLE_SERVICE = "6e1d0001-8a3c-4c5b-9b1e-1ed0c0dec0de"
+BLE_CMD = "6e1d0002-8a3c-4c5b-9b1e-1ed0c0dec0de"
+BLE_STATE = "6e1d0003-8a3c-4c5b-9b1e-1ed0c0dec0de"
+CHEF_HOST = "led-decke-reihe1.local"   # Name des ESP32 im WLAN (nur ohne Bluetooth)
 UDP_PORT = 4210
 ROWS, COLS = 9, 7
 MAX_BRIGHTNESS = 160                   # wie im ESP32
@@ -183,17 +194,79 @@ class Chef:
             return False
         self.misses = 0
         self.addr = (sender[0], UDP_PORT)
-        self.state = {
-            "mode": data[1] - 256 if data[1] > 127 else data[1],
-            "brightness": data[2],
-            "max": data[3],
-            "boxes": [[tuple(data[10 + (r * COLS + c) * 3:13 + (r * COLS + c) * 3]) for c in range(COLS)]
-                      for r in range(ROWS)],
-            "frame": [[tuple(data[10 + ROWS * COLS * 3 + (r * COLS + c) * 3:
-                                  13 + ROWS * COLS * 3 + (r * COLS + c) * 3]) for c in range(COLS)]
-                      for r in range(ROWS)],
-        }
+        self.state = parse_state(data)
         return True
+
+
+class BleChef:
+    """Verbindung zum ESP32 per Bluetooth – gleiche Bedienung wie Chef."""
+
+    def __init__(self):
+        self.state = None
+        self.online = False
+        self.ever_online = False
+        self.todo = queue.Queue()
+        self.pending = None
+        threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True).start()
+
+    def post(self, cmd):
+        """Befehl im Hintergrund schicken – das Launchpad wartet nie auf die Decke."""
+        self.todo.put(cmd)
+
+    async def _run(self):
+        while True:                    # suchen, verbinden, bei Abbruch von vorn
+            try:
+                dev = await BleakScanner.find_device_by_filter(
+                    lambda d, ad: d.name == BLE_NAME or BLE_SERVICE in (ad.service_uuids or []),
+                    timeout=10)
+                if dev is None:
+                    continue
+                async with BleakClient(dev) as client:
+                    print("Decke per Bluetooth verbunden", flush=True)
+                    await self._talk(client)
+            except Exception as e:     # Bluetooth-Fehler: kurz warten, neu verbinden
+                print("Bluetooth:", e, flush=True)
+            self.online = False
+            await asyncio.sleep(1)
+
+    async def _talk(self, client):
+        last_read = 0
+        while client.is_connected:
+            if self.pending is None:
+                try:
+                    self.pending = self.todo.get_nowait()
+                except queue.Empty:
+                    pass
+            if self.pending is not None:    # bleibt gemerkt, bis er sicher angekommen ist
+                await client.write_gatt_char(BLE_CMD, json.dumps(self.pending, separators=(",", ":")).encode(),
+                                             response=True)
+                self.pending = None
+                continue
+            if time.monotonic() - last_read >= POLL:
+                last_read = time.monotonic()
+                data = bytes(await client.read_gatt_char(BLE_STATE))
+                st = parse_state(data)
+                if st:
+                    self.state = st
+                    self.online = self.ever_online = True
+            else:
+                await asyncio.sleep(0.01)
+
+
+def parse_state(data):
+    """Zustand vom ESP32 (Bytes) -> dict, oder None wenn kaputt."""
+    if len(data) != 10 + ROWS * COLS * 6 or data[0] != 1:
+        return None
+    return {
+        "mode": data[1] - 256 if data[1] > 127 else data[1],
+        "brightness": data[2],
+        "max": data[3],
+        "boxes": [[tuple(data[10 + (r * COLS + c) * 3:13 + (r * COLS + c) * 3]) for c in range(COLS)]
+                  for r in range(ROWS)],
+        "frame": [[tuple(data[10 + ROWS * COLS * 3 + (r * COLS + c) * 3:
+                              13 + ROWS * COLS * 3 + (r * COLS + c) * 3]) for c in range(COLS)]
+                  for r in range(ROWS)],
+    }
 
 
 def hexcolor(c):
@@ -316,7 +389,7 @@ def main():
             print(e, "– neuer Versuch in 5 s", flush=True)
             time.sleep(5)
 
-    chef = Chef()
+    chef = BleChef() if BleakClient else Chef()
     sim = SimDecke()
     selected = set()          # ausgewählte Kästen (blinken)
     remembered = {}           # Grundfarbe von Kästen, die per Helligkeit ganz aus sind

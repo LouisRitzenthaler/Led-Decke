@@ -1,7 +1,7 @@
 // LED-Decke – Firmware für EINEN ESP32, der alle 14 Streifen steuert
 //
 // Der ESP32 verbindet sich per Bluetooth mit der Steuerseite am Handy und per
-// WLAN mit dem Raspberry Pi (Launchpad). Updates gehen per WLAN (OTA).
+// Bluetooth mit dem Raspberry Pi (Launchpad). Nur Updates gehen per WLAN (OTA).
 // Einstellungen stehen direkt hier unten.
 
 #include <Arduino.h>
@@ -131,7 +131,7 @@ void showAll() {
 
 // ---------------------------------------------------------------------
 //  WLAN: Updates (Arduino IDE oder Browser http://IP/update) und Launchpad.
-//  Ist das WLAN nicht da, wird alle 10 s neu versucht.
+//  Ist das WLAN nicht da, wird alle 30 s neu versucht.
 // ---------------------------------------------------------------------
 WebServer web(80);
 HTTPUpdateServer webUpdater;
@@ -154,7 +154,7 @@ void startWifi() {
 // In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
 void handleNetwork() {
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiTry > 10000) {
+    if (millis() - lastWifiTry > 30000) {  // selten, damit Bluetooth nicht gestört wird
       lastWifiTry = millis();
       WiFi.reconnect();
     }
@@ -451,10 +451,18 @@ class CmdCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// Nach jeder Verbindung weiter sichtbar bleiben: Handy und Raspberry Pi gleichzeitig
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *srv, NimBLEConnInfo &info) override {
+    if (srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) NimBLEDevice::startAdvertising();
+  }
+};
+
 void startBle() {
   NimBLEDevice::init(BLE_NAME);
   NimBLEDevice::setMTU(517);
   NimBLEServer *srv = NimBLEDevice::createServer();
+  srv->setCallbacks(new ServerCallbacks());
   srv->advertiseOnDisconnect(true);
   NimBLEService *svc = srv->createService(BLE_SERVICE_UUID);
   svc->createCharacteristic(BLE_CMD_UUID, NIMBLE_PROPERTY::WRITE, 512)->setCallbacks(new CmdCallbacks());

@@ -20,6 +20,16 @@ if ! sudo apt-get install -y python3-mido python3-rtmidi; then
 fi
 python3 -c "import mido, rtmidi" || { echo "FEHLER: mido/rtmidi fehlen"; exit 1; }
 
+echo "== Bluetooth einrichten =="
+sudo apt-get install -y bluez || true
+if ! sudo apt-get install -y python3-bleak; then
+  sudo apt-get install -y python3-pip
+  sudo pip3 install bleak --break-system-packages 2>/dev/null || sudo pip3 install bleak
+fi
+python3 -c "import bleak" || { echo "FEHLER: bleak fehlt"; exit 1; }
+sudo rfkill unblock bluetooth || true
+sudo systemctl enable --now bluetooth || true
+
 # Das WLAN, in dem der Pi gerade ist (der Hotspot), beim Start bevorzugen
 if command -v nmcli > /dev/null; then
   WLAN="$(nmcli -t -f NAME,TYPE connection show --active | grep ':802-11-wireless$' | head -1 | cut -d: -f1)"
@@ -37,12 +47,12 @@ echo "== Autostart einrichten =="
 sudo tee /etc/systemd/system/led-decke-launchpad.service > /dev/null <<UNIT
 [Unit]
 Description=LED-Decke Launchpad
-After=network-online.target sound.target
-Wants=network-online.target
+After=bluetooth.target sound.target
+Wants=bluetooth.target
 
 [Service]
 User=$USER_NAME
-SupplementaryGroups=audio
+SupplementaryGroups=audio bluetooth
 ExecStart=/usr/bin/python3 $DIR/launchpad.py
 Restart=always
 RestartSec=3
