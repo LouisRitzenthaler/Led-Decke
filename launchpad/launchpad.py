@@ -52,6 +52,7 @@ class Launchpad:
             self.kind, self.dev, self.scale, self.top = "mk3", 0x0D, 127, 91
         in_name = next((n for n in mido.get_input_names() if n == name), None) or \
             next(n for n in mido.get_input_names() if name.split(":")[0] in n)
+        self.name = name
         self.shown = {}
         self.out = mido.open_output(name)
         self.inp = mido.open_input(in_name)
@@ -86,6 +87,10 @@ class Launchpad:
             for i, (r, g, b) in leds.items():
                 data += [0x03, i, r * s // 255, g * s // 255, b * s // 255]
         self._sysex(data)
+
+    def still_there(self):
+        """False, wenn das Launchpad abgesteckt (oder neu eingesteckt) wurde."""
+        return self.name in mido.get_output_names()
 
     def presses(self):
         """Gedrückte Tasten als Index (wie led_index)."""
@@ -180,6 +185,7 @@ def main():
 
     last_poll = 0
     last_warn = -100
+    last_check = 0
     while True:
         try:
             for i in lp.presses():
@@ -208,6 +214,11 @@ def main():
                         chef.send({"op": "settings", "brightness": bri})
 
             now = time.monotonic()
+            if now - last_check >= 2:
+                last_check = now
+                if not lp.still_there():   # neu eingesteckt -> Dienst startet neu und verbindet sich
+                    print("Launchpad abgesteckt, starte neu", flush=True)
+                    sys.exit(1)
             if now - last_poll >= POLL:
                 last_poll = now
                 if not chef.send({"op": "get"}) and chef.state is None and now - last_warn > 30:
