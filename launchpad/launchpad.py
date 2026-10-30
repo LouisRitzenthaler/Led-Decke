@@ -3,9 +3,9 @@
 
 Belegung (Launchpad liegt normal, Logo oben rechts):
   - linke 7 Spalten, 8 Pad-Reihen + obere Tastenreihe = die 7x9 Kästen
-  - 8. Spalte (inkl. oberer Taste) = ganze Querreihe ein/aus
-  - rechte Spalte von oben: Helligkeit +, Helligkeit -, Farbverlauf +,
-    Farbverlauf -, Rot, Grün, Blau, Weiß
+  - 8. Spalte, unter der oberen Taste, von oben: Helligkeit +, Helligkeit -,
+    Farbverlauf +, Farbverlauf -, Rot, Grün, Blau, Weiß
+  - 8. obere Taste und rechte Spalte (9) sind noch frei
 
 Kasten drücken: er blinkt (ausgewählt), nochmal drücken: abgewählt. Die Tasten
 rechts ändern dann Farbe, Farbverlauf und Helligkeit der ausgewählten Kästen.
@@ -211,14 +211,14 @@ def main():
     last_color = BASIC["white"]
 
     # Tasten-Index -> was sie tun
-    box_at, line_at, func_at = {}, {}, {}
+    box_at, func_at = {}, {}
     for r in range(ROWS):              # Kasten-Zeile 0 = oben = obere Tastenreihe
         y = 9 - r
         for c in range(COLS):
             box_at[lp.led_index(c + 1, y)] = (r, c)
-        line_at[lp.led_index(8, y)] = r
-    for k, f in enumerate(FUNCTIONS):  # rechte Spalte, von oben nach unten
-        func_at[(8 - k) * 10 + 9] = f
+    for k, f in enumerate(FUNCTIONS):  # Spalte 8, Reihe b bis i (von oben nach unten)
+        func_at[lp.led_index(8, 8 - k)] = f
+    unused = [lp.led_index(8, 9)] + [lp.led_index(9, y) for y in range(1, 9)]   # noch frei: dunkel
 
     def apply(changes):
         """changes: {(r, c): farbe} -> an die Decke, gleiche Farben in einem Befehl."""
@@ -277,14 +277,11 @@ def main():
     while True:
         try:
             for i in lp.presses():
-                if (i in box_at or i in line_at) and deselect_at:
+                if i in box_at and deselect_at:
                     selected.clear()           # neue Auswahl beginnt
                     deselect_at = None
                 if i in box_at:
                     selected ^= {box_at[i]}
-                elif i in line_at:
-                    row = {(line_at[i], c) for c in range(COLS)}
-                    selected = selected - row if row <= selected else selected | row
                 elif i in func_at:
                     on_function(func_at[i], chef.state)
 
@@ -310,9 +307,8 @@ def main():
                 if (r, c) in selected:
                     col = (col if max(col) > 30 else (90, 90, 90)) if blink_on else (0, 0, 0)
                 leds[i] = col
-            for i, r in line_at.items():
-                full = all((r, c) in selected for c in range(COLS))
-                leds[i] = (255, 255, 255) if full and blink_on else (35, 35, 35)
+            for i in unused:
+                leds[i] = (0, 0, 0)
             first = next(iter(selected), None)
             sel_color = split(st["boxes"][first[0]][first[1]])[0] if st and first else None
             for i, f in func_at.items():
