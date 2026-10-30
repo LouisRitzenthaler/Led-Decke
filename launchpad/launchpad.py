@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """LED-Decke – Novation Launchpad als Wand-Schaltfeld (läuft auf dem Raspberry Pi).
 
-Belegung (Launchpad liegt normal, Logo oben rechts):
-  - linke 7 Spalten, 8 Pad-Reihen + obere Tastenreihe = die 7x9 Kästen
-  - 8. Spalte, unter der oberen Taste, von oben: Helligkeit +, Helligkeit -,
-    Farbverlauf +, Farbverlauf -, Rot, Grün, Blau, Weiß
-  - 8. obere Taste und rechte Spalte (9) sind noch frei
+Belegung (Spalten 1-9 von links, Reihen a-i von oben, a = obere runde Tasten):
+  - 1-7 / a-i   = die 7x9 Kästen. Drücken: blinkt = ausgewählt, nochmal: abgewählt
+  - Spalte 8    = 9 Farben (a Rot ... i Weiß) für die ausgewählten Kästen
+  - 9b / 9c     = Helligkeit + / - (ausgewählte Kästen, ohne Auswahl die ganze Decke)
+  - 9d - 9i     = Effekte. Nochmal drücken = Effekt aus
 
-Kasten drücken: er blinkt (ausgewählt), nochmal drücken: abgewählt. Die Tasten
-rechts ändern dann Farbe, Farbverlauf und Helligkeit der ausgewählten Kästen.
-Nach einer Farbe ist die Auswahl sofort weg, nach Helligkeit/Verlauf 2,5 s nach
-dem letzten Drücken (so kann man mehrmals drücken).
-Ist nichts ausgewählt, ändert Helligkeit +/- die ganze Decke.
-Der Pi schickt die Befehle per WLAN (UDP) an den Chef-ESP32 und zeigt auf dem
-Launchpad immer die echten Farben der Decke an.
+Nach einer Farbe ist die Auswahl sofort weg, nach Helligkeit 2,5 s nach dem
+letzten Drücken (so kann man mehrmals drücken).
+Der Pi schickt die Befehle per WLAN (UDP) an den ESP32 und zeigt auf dem
+Launchpad die echten Farben der Decke. Antwortet keine Decke, spielt das
+Programm die Decke nach (Testmodus), damit man das Launchpad ausprobieren kann.
 """
 import colorsys
 import json
+import math
 import queue
+import random
 import socket
 import sys
 import threading
@@ -25,16 +25,22 @@ import time
 
 import mido
 
-CHEF_HOST = "led-decke-reihe1.local"   # Name des Chef-ESP32 im WLAN
+CHEF_HOST = "led-decke-reihe1.local"   # Name des ESP32 im WLAN
 UDP_PORT = 4210
 ROWS, COLS = 9, 7
+MAX_BRIGHTNESS = 160                   # wie im ESP32
 BRIGHTNESS_STEP = 16
-HUE_STEP = 1 / 24                      # 24 Schritte = einmal durch den Farbkreis
 POLL = 0.1                             # so oft (Sekunden) die Farben der Decke holen
-DESELECT_AFTER = 2.5                   # Auswahl endet so viele Sekunden nach Helligkeit/Verlauf
+DESELECT_AFTER = 2.5                   # Auswahl endet so viele Sekunden nach Helligkeit
 
-FUNCTIONS = ["bri+", "bri-", "hue+", "hue-", "red", "green", "blue", "white"]
-BASIC = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255), "white": (255, 255, 255)}
+# Spalte 8, von a bis i
+COLORS = [(255, 0, 0), (255, 90, 0), (255, 210, 0), (0, 255, 0), (0, 255, 200),
+          (0, 0, 255), (140, 0, 255), (255, 0, 140), (255, 255, 255)]
+# Spalte 9, von d bis i: (Name im ESP32, Farbe der Taste)
+EFFECTS = [("rainbow", (255, 0, 255)), ("colorfade", (0, 255, 255)), ("wave", (0, 80, 255)),
+           ("breathe", (255, 90, 0)), ("sparkle", (255, 255, 255)), ("rain", (0, 160, 255))]
+# Reihenfolge der Effekte im ESP32 (für die Nummer im Zustand)
+ESP_EFFECTS = ["rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test"]
 
 
 # ---------------------------------------------------------------------
@@ -122,6 +128,7 @@ class Chef:
         self.state = None
         self.next_lookup = 0
         self.online = False
+        self.ever_online = False
         self.todo = queue.Queue()
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -136,6 +143,7 @@ class Chef:
             except queue.Empty:
                 cmd = {"op": "get"}
             self.online = self.send(cmd)
+            self.ever_online = self.ever_online or self.online
 
     def _find(self):
         # Den Namen nur alle 30 s nachschlagen (das kann ein paar Sekunden dauern),
@@ -162,6 +170,7 @@ class Chef:
             return False
         self.addr = (sender[0], UDP_PORT)
         self.state = {
+            "mode": data[1] - 256 if data[1] > 127 else data[1],
             "brightness": data[2],
             "max": data[3],
             "boxes": [[tuple(data[10 + (r * COLS + c) * 3:13 + (r * COLS + c) * 3]) for c in range(COLS)]
@@ -196,6 +205,80 @@ def scale(base, level):
     return tuple(int(v * level) for v in base)
 
 
+def hsv(h, s=1.0, v=1.0):
+    return tuple(int(x * 255) for x in colorsys.hsv_to_rgb(h % 1, s, v))
+
+
+# ---------------------------------------------------------------------
+#  Testmodus: spielt die Decke nach, solange kein ESP32 antwortet
+# ---------------------------------------------------------------------
+class SimDecke:
+    def __init__(self):
+        self.online = True
+        self.boxes = [[(0, 0, 0)] * COLS for _ in range(ROWS)]
+        self.mode = -1
+        self.brightness = MAX_BRIGHTNESS // 2
+        self.fx = (255, 106, 0)
+        self.spark = {}
+        self.drops = [[-10.0, 0.0] for _ in range(COLS)]
+        self.t0 = time.monotonic()
+
+    def post(self, cmd):
+        op = cmd.get("op")
+        if op == "boxes":
+            col = tuple(int(cmd["color"][i:i + 2], 16) for i in (1, 3, 5))
+            for r, c in cmd["cells"]:
+                self.boxes[r][c] = col
+            self.mode = -1
+        elif op == "settings":
+            if "brightness" in cmd:
+                self.brightness = max(0, min(MAX_BRIGHTNESS, cmd["brightness"]))
+            if "color" in cmd:
+                self.fx = tuple(int(cmd["color"][i:i + 2], 16) for i in (1, 3, 5))
+            if "mode" in cmd:
+                self.mode = ESP_EFFECTS.index(cmd["mode"]) if cmd["mode"] in ESP_EFFECTS else -1
+
+    def _frame(self):
+        t = time.monotonic() - self.t0
+        m = self.mode
+        if m < 0:
+            return [row[:] for row in self.boxes]
+        f = [[(0, 0, 0)] * COLS for _ in range(ROWS)]
+        for r in range(ROWS):
+            for c in range(COLS):
+                if m == 0:
+                    f[r][c] = hsv(t * 0.1 + (r + c) / (ROWS + COLS))
+                elif m == 1:
+                    f[r][c] = hsv(t * 0.05)
+                elif m == 2:
+                    f[r][c] = scale(self.fx, 0.08 + 0.92 * (math.sin(r * 0.8 - t * 2.5) + 1) / 2)
+                elif m == 3:
+                    f[r][c] = scale(self.fx, 0.05 + 0.95 * (math.sin(t * 1.5) + 1) / 2)
+        if m == 4:
+            if random.random() < 0.5:
+                self.spark[(random.randrange(ROWS), random.randrange(COLS))] = (t, random.random())
+            self.spark = {k: v for k, v in self.spark.items() if t - v[0] < 1.5}
+            for (r, c), (start, h) in self.spark.items():
+                f[r][c] = hsv(h, 0.6, 1 - (t - start) / 1.5)
+        if m == 5:
+            for c, d in enumerate(self.drops):
+                if t - d[0] > d[1]:
+                    d[0], d[1] = t - random.random(), ROWS / 4 + random.random() * 2
+                head = (t - d[0]) * 4
+                for r in range(ROWS):
+                    if 0 <= head - r < 4:
+                        f[r][c] = scale(self.fx, 1 - (head - r) / 4)
+        return f
+
+    @property
+    def state(self):
+        return {"mode": self.mode, "brightness": self.brightness, "max": MAX_BRIGHTNESS,
+                "boxes": self.boxes, "frame": self._frame()}
+
+
+# ---------------------------------------------------------------------
+#  Hauptprogramm
+# ---------------------------------------------------------------------
 def main():
     while True:
         try:
@@ -206,84 +289,99 @@ def main():
             time.sleep(5)
 
     chef = Chef()
+    sim = SimDecke()
     selected = set()          # ausgewählte Kästen (blinken)
     remembered = {}           # Grundfarbe von Kästen, die per Helligkeit ganz aus sind
-    last_color = BASIC["white"]
+    deselect_at = None        # Zeitpunkt, an dem die Auswahl nach Helligkeit endet
 
-    # Tasten-Index -> was sie tun
-    box_at, func_at = {}, {}
-    for r in range(ROWS):              # Kasten-Zeile 0 = oben = obere Tastenreihe
+    def deck():
+        """Die echte Decke, sobald sie einmal geantwortet hat, sonst der Testmodus."""
+        return chef if chef.ever_online else sim
+
+    # Tasten-Index -> was sie tun. Reihe a = obere Tasten (y=9), i = unten (y=1)
+    box_at, color_at, func_at = {}, {}, {}
+    for r in range(ROWS):
         y = 9 - r
         for c in range(COLS):
             box_at[lp.led_index(c + 1, y)] = (r, c)
-    for k, f in enumerate(FUNCTIONS):  # Spalte 8, Reihe b bis i (von oben nach unten)
-        func_at[lp.led_index(8, 8 - k)] = f
-    unused = [lp.led_index(8, 9)] + [lp.led_index(9, y) for y in range(1, 9)]   # noch frei: dunkel
+        color_at[lp.led_index(8, y)] = COLORS[r]
+    func_at[lp.led_index(9, 8)] = "bri+"
+    func_at[lp.led_index(9, 7)] = "bri-"
+    for k, (name, _) in enumerate(EFFECTS):
+        func_at[lp.led_index(9, 6 - k)] = name
+    effect_color = dict(EFFECTS)
 
-    def apply(changes):
+    def apply(d, changes):
         """changes: {(r, c): farbe} -> an die Decke, gleiche Farben in einem Befehl."""
         by_color = {}
         for cell, col in changes.items():
             by_color.setdefault(col, []).append(list(cell))
         for col, cells in by_color.items():
-            chef.post({"op": "boxes", "color": hexcolor(col), "cells": cells})
-        if chef.state:                 # sofort merken, damit schnelles Drücken nicht verloren geht
+            d.post({"op": "boxes", "color": hexcolor(col), "cells": cells})
+        st = d.state
+        if st and d is chef:           # sofort merken, damit schnelles Drücken nicht verloren geht
             for (r, c), col in changes.items():
-                chef.state["boxes"][r][c] = col
+                st["boxes"][r][c] = col
+            st["mode"] = -1
 
-    deselect_at = None        # Zeitpunkt, an dem die Auswahl nach Helligkeit/Verlauf endet
-
-    def on_function(f, st):
-        nonlocal last_color, deselect_at
-        if not selected:
-            if f in ("bri+", "bri-") and st:   # nichts ausgewählt: ganze Decke heller/dunkler
-                step = BRIGHTNESS_STEP if f == "bri+" else -BRIGHTNESS_STEP
-                st["brightness"] = max(0, min(st["max"], st["brightness"] + step))
-                chef.post({"op": "settings", "brightness": st["brightness"]})
-            elif f in BASIC:
-                last_color = BASIC[f]
+    def on_color(col):
+        d = deck()
+        st = d.state
+        if not selected:               # nichts ausgewählt: Farbe für Effekte wie Welle/Atmen
+            d.post({"op": "settings", "color": hexcolor(col)})
             return
+        if st:
+            apply(d, {(r, c): scale(col, split(st["boxes"][r][c])[1] or 1.0) for r, c in selected})
+        selected.clear()
+
+    def on_function(f):
+        nonlocal deselect_at
+        d = deck()
+        st = d.state
         if not st:
             return
-        changes = {}
-        for r, c in selected:
-            base, level = split(st["boxes"][r][c])
-            if f in BASIC:
-                last_color = BASIC[f]
-                changes[(r, c)] = scale(BASIC[f], level if level > 0 else 1.0)
-            elif f in ("hue+", "hue-") and base:
-                h, sat, _ = colorsys.rgb_to_hsv(*[v / 255 for v in base])
-                if sat < 0.05:                 # Weiß hat keinen Farbton: bei Rot anfangen
-                    h, sat = 0.0, 1.0
-                h = (h + (HUE_STEP if f == "hue+" else -HUE_STEP)) % 1
-                new_base = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(h, sat, 1))
-                changes[(r, c)] = scale(new_base, level)
-            elif f in ("bri+", "bri-"):
+        if f in ("bri+", "bri-"):
+            step = 1 if f == "bri+" else -1
+            if not selected:           # ganze Decke heller/dunkler
+                bri = max(0, min(st["max"], st["brightness"] + step * BRIGHTNESS_STEP))
+                d.post({"op": "settings", "brightness": bri})
+                if d is chef:
+                    st["brightness"] = bri
+                return
+            changes = {}
+            for r, c in selected:
+                base, level = split(st["boxes"][r][c])
                 if base is None:
-                    base = remembered.get((r, c), last_color)
-                level = round(min(1.0, max(0.0, level + (0.1 if f == "bri+" else -0.1))), 1)
+                    base = remembered.get((r, c), (255, 255, 255))
+                level = round(min(1.0, max(0.0, level + step * 0.1)), 1)
                 if level == 0:
                     remembered[(r, c)] = base
                 changes[(r, c)] = scale(base, level)
-        apply(changes)
-        if f in BASIC:
-            selected.clear()           # Farbe gewählt -> fertig
+            apply(d, changes)
+            deselect_at = time.monotonic() + DESELECT_AFTER
+        else:                          # Effekt: an, oder aus wenn er schon läuft
+            running = st["mode"] >= 0 and ESP_EFFECTS[st["mode"]] == f
+            d.post({"op": "settings", "mode": "static" if running else f})
+            if d is chef:
+                st["mode"] = -1 if running else ESP_EFFECTS.index(f)
+            selected.clear()
             deselect_at = None
-        else:
-            deselect_at = time.monotonic() + DESELECT_AFTER   # mehrmals drücken möglich
 
     last_warn = time.monotonic() - 25
     last_check = 0
     while True:
         try:
             for i in lp.presses():
-                if i in box_at and deselect_at:
-                    selected.clear()           # neue Auswahl beginnt
-                    deselect_at = None
                 if i in box_at:
+                    if deselect_at:            # nach Helligkeit: neue Auswahl beginnt
+                        selected.clear()
+                        deselect_at = None
                     selected ^= {box_at[i]}
+                elif i in color_at:
+                    on_color(color_at[i])
+                    deselect_at = None
                 elif i in func_at:
-                    on_function(func_at[i], chef.state)
+                    on_function(func_at[i])
 
             now = time.monotonic()
             if deselect_at and now >= deselect_at:
@@ -294,30 +392,32 @@ def main():
                 if not lp.still_there():   # neu eingesteckt -> Dienst startet neu und verbindet sich
                     print("Launchpad abgesteckt, starte neu", flush=True)
                     sys.exit(1)
-            if not chef.online and now - last_warn > 30:
+            if not chef.ever_online and now - last_warn > 30:
                 last_warn = now
-                print("Decke antwortet nicht (WLAN an? ESP32 an?)", flush=True)
+                print("Keine Decke gefunden – Testmodus (Launchpad spielt die Decke nach)", flush=True)
 
-            # Launchpad anzeigen: ausgewählte Kästen blinken
+            # Launchpad anzeigen: Farben der Decke (mit Helligkeit), Auswahl blinkt
             blink_on = int(now * 3) % 2 == 0
+            st = deck().state
             leds = {}
-            st = chef.state
+            level = max(0.15, st["brightness"] / st["max"]) if st else 1.0
             for i, (r, c) in box_at.items():
-                col = st["frame"][r][c] if st else (0, 0, 0)
+                col = scale(st["frame"][r][c], level) if st else (0, 0, 0)
                 if (r, c) in selected:
                     col = (col if max(col) > 30 else (90, 90, 90)) if blink_on else (0, 0, 0)
                 leds[i] = col
-            for i in unused:
-                leds[i] = (0, 0, 0)
-            first = next(iter(selected), None)
-            sel_color = split(st["boxes"][first[0]][first[1]])[0] if st and first else None
+            for i, col in color_at.items():
+                leds[i] = col
+            mode = ESP_EFFECTS[st["mode"]] if st and 0 <= st["mode"] < len(ESP_EFFECTS) else None
             for i, f in func_at.items():
-                if f in BASIC:
-                    leds[i] = BASIC[f]
-                elif f.startswith("hue"):
-                    leds[i] = sel_color or (60, 60, 60)
+                if f == "bri+":
+                    leds[i] = (255, 255, 255)
+                elif f == "bri-":
+                    leds[i] = (40, 40, 40)
+                elif f == mode:            # laufender Effekt blinkt
+                    leds[i] = effect_color[f] if blink_on else (0, 0, 0)
                 else:
-                    leds[i] = (255, 255, 255) if f == "bri+" else (40, 40, 40)
+                    leds[i] = dim(effect_color[f], 0.35)
             lp.show(leds)
             time.sleep(0.01)
         except OSError as e:           # Launchpad abgesteckt o. Ä. -> Dienst startet neu
