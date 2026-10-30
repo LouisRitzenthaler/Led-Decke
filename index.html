@@ -7,6 +7,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <title>LED-Decke</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
 <style>
   :root {
     --bg: #111318; --panel: #1b1e26; --line: #2c303b; --text: #eef0f4;
@@ -384,6 +387,7 @@ if (USE_BLE) {  // leeres Raster anzeigen, bis die Decke verbunden ist
     speed: 1, color, effects: EFFECTS, scenes: [] });
 }
 poll();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
 </body>
 </html>
