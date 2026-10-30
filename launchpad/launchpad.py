@@ -331,7 +331,7 @@ def main():
     for r in range(ROWS):
         y = 9 - r
         for c in range(COLS):
-            box_at[lp.led_index(c + 1, y)] = (ROWS - 1 - r, COLS - 1 - c)   # Launchpad hängt 180° gedreht zur Decke
+            box_at[lp.led_index(c + 1, y)] = (ROWS - 1 - r, c)   # a-i laufen an der Decke andersherum
         color_at[lp.led_index(8, y)] = COLORS[r]
     func_at[lp.led_index(9, 8)] = "on"
     func_at[lp.led_index(9, 7)] = "off"
