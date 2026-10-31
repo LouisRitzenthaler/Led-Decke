@@ -41,7 +41,7 @@ UDP_PORT = 4210
 ROWS, COLS = 9, 7
 MAX_BRIGHTNESS = 160                   # wie im ESP32
 BRIGHTNESS_STEP = 16
-POLL = 0.1                             # so oft (Sekunden) die Farben der Decke holen
+POLL = 0.05                            # so oft (Sekunden) die Farben der Decke holen
 DESELECT_AFTER = 2.5                   # Auswahl endet so viele Sekunden nach Helligkeit
 
 # Spalte 8, von a bis i

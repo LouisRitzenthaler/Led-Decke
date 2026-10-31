@@ -397,8 +397,9 @@ $("saveScene").onclick = async () => {
 // --- Abgleich mit dem Pi (auch wenn mehrere Handys steuern) ----------------
 async function poll() {
   if ((!USE_BLE || ble) && !painting && !pending.size && !flushTimer) update(await api("GET", "/api/state"));
+  // Oft nachfragen, damit Änderungen vom Launchpad sofort zu sehen sind
   const live = S && S.mode !== "static";
-  setTimeout(poll, live ? (USE_BLE ? 300 : 150) : 2000);
+  setTimeout(poll, live ? 120 : 250);
 }
 setColor(color);
 if (USE_BLE) {  // leeres Raster anzeigen, bis die Decke verbunden ist
