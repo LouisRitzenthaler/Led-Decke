@@ -134,18 +134,22 @@ void showAll() {
 
 // ---------------------------------------------------------------------
 //  WLAN: Updates (Arduino IDE oder Browser http://IP/update) und Launchpad.
-//  Ist das WLAN nicht da, wird alle 30 s neu versucht.
+//  Das WLAN-Suchen stört Bluetooth stark. Deshalb: Ist das WLAN 2 Minuten nach
+//  dem Einschalten nicht da (oder 1 Minute weg), wird es ganz abgeschaltet.
+//  Für ein Update: Hotspot an, dann die Decke einmal aus- und einschalten.
 // ---------------------------------------------------------------------
 WebServer web(80);
 HTTPUpdateServer webUpdater;
 bool otaStarted = false;
 void bluetoothPause(bool pause);
 unsigned long lastWifiTry = 0;
+unsigned long wifiUntil = 120000;  // so lange (ms seit Start) darf das WLAN suchen
+bool wifiOff = false;
 
 void startWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.printf("Verbinde mit WLAN \"%s\"", WIFI_SSID);
   for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
@@ -157,13 +161,20 @@ void startWifi() {
 
 // In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
 void handleNetwork() {
+  if (wifiOff) return;
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiTry > 30000) {  // selten, damit Bluetooth nicht gestört wird
+    if (millis() > wifiUntil) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      wifiOff = true;
+      Serial.println("WLAN aus (nur Bluetooth)");
+    } else if (millis() - lastWifiTry > 15000) {
       lastWifiTry = millis();
       WiFi.reconnect();
     }
     return;
   }
+  wifiUntil = millis() + 60000;
   if (!otaStarted) {
     otaStarted = true;
     ArduinoOTA.setHostname(HOSTNAME);

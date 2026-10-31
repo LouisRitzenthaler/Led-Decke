@@ -399,7 +399,7 @@ async function poll() {
   if ((!USE_BLE || ble) && !painting && !pending.size && !flushTimer) update(await api("GET", "/api/state"));
   // Oft nachfragen, damit Änderungen vom Launchpad sofort zu sehen sind
   const live = S && S.mode !== "static";
-  setTimeout(poll, live ? 120 : 250);
+  setTimeout(poll, live ? 200 : 400);
 }
 setColor(color);
 if (USE_BLE) {  // leeres Raster anzeigen, bis die Decke verbunden ist

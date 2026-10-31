@@ -41,7 +41,7 @@ UDP_PORT = 4210
 ROWS, COLS = 9, 7
 MAX_BRIGHTNESS = 160                   # wie im ESP32
 BRIGHTNESS_STEP = 16
-POLL = 0.05                            # so oft (Sekunden) die Farben der Decke holen
+POLL = 0.1                             # so oft (Sekunden) die Farben der Decke holen
 DESELECT_AFTER = 2.5                   # Auswahl endet so viele Sekunden nach Helligkeit
 
 # Spalte 8, von a bis i
@@ -256,7 +256,7 @@ class BleChef:
             if self.pending is not None:    # bleibt gemerkt, bis er sicher angekommen ist
                 data = json.dumps(self.pending, separators=(",", ":")).encode()
                 # Ist die Decke plötzlich weg (Strom aus), nicht ewig warten
-                await asyncio.wait_for(client.write_gatt_char(BLE_CMD, data, response=True), 3)
+                await asyncio.wait_for(client.write_gatt_char(BLE_CMD, data, response=True), 6)
                 self.pending = None
                 continue
             if time.monotonic() - last_read >= POLL:
@@ -266,7 +266,7 @@ class BleChef:
                 await asyncio.sleep(0.01)
 
     async def _read(self, client):
-        data = bytes(await asyncio.wait_for(client.read_gatt_char(BLE_STATE), 3))
+        data = bytes(await asyncio.wait_for(client.read_gatt_char(BLE_STATE), 6))
         st = parse_state(data)
         if st is None:
             print("Zustand der Decke unlesbar (%d Bytes)" % len(data), flush=True)
