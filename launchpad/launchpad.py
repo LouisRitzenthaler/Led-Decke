@@ -51,7 +51,8 @@ COLORS = [(255, 0, 0), (255, 90, 0), (255, 210, 0), (0, 255, 0), (0, 255, 200),
 EFFECTS = [("rainbow", (255, 0, 255)), ("colorfade", (0, 255, 255)), ("wave", (0, 80, 255)),
            ("sparkle", (255, 255, 255))]
 # Reihenfolge der Effekte im ESP32 (für die Nummer im Zustand)
-ESP_EFFECTS = ["rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test"]
+ESP_EFFECTS = ["rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test",
+               "music_pulse", "music_vu", "music_beat"]
 
 
 # ---------------------------------------------------------------------

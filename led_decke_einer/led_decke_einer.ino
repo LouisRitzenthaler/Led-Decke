@@ -37,6 +37,8 @@ const uint8_t PIN_B[COLS] = {17, 19, 22, 25, 27, 33, 13};
 const bool A_STARTS_AT_TOP[COLS] = {true, true, true, true, true, true, true};
 const bool B_STARTS_AT_TOP[COLS] = {true, true, true, true, true, true, true};
 
+#define MIC_PIN 34   // Mikrofon-Modul: OUT an GPIO 34, VCC an 3V3, GND an GND
+
 #define LED_PIXEL_TYPE NEO_GRBW
 #define USE_WHITE_CHANNEL true
 #define MAX_BRIGHTNESS 160
@@ -213,8 +215,10 @@ struct Scene {
 };
 Scene scenes[MAX_SCENES];
 
-const char *EFFECT_IDS[] = {"rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test"};
-const char *EFFECT_NAMES[] = {"Regenbogen", "Farbwechsel", "Welle", "Atmen", "Funkeln", "Regen", "Verkabelungstest"};
+const char *EFFECT_IDS[] = {"rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test",
+                            "music_pulse", "music_vu", "music_beat"};
+const char *EFFECT_NAMES[] = {"Regenbogen", "Farbwechsel", "Welle", "Atmen", "Funkeln", "Regen", "Verkabelungstest",
+                              "Puls", "Pegel", "Beat-Farben"};
 const int NUM_EFFECTS = sizeof(EFFECT_IDS) / sizeof(EFFECT_IDS[0]);
 const int WIRING_TEST = 6;
 
@@ -261,6 +265,38 @@ CRGB hue(float h, uint8_t s = 255, uint8_t v = 255) {
 void fillFrame(CRGB c) {
   for (int r = 0; r < ROWS; r++)
     for (int c2 = 0; c2 < COLS; c2++) frame[r][c2] = c;
+}
+
+// ---------------------------------------------------------------------
+//  Mikrofon: läuft nebenher und misst, wie laut es gerade ist.
+//  Die Empfindlichkeit passt sich von selbst an (leise Musik = trotzdem volle Wirkung).
+// ---------------------------------------------------------------------
+volatile float micLevel = 0;      // 0..1
+volatile uint32_t micBeats = 0;   // zählt die Schläge (Bass, Klatschen ...)
+
+void micTask(void *) {
+  float loudest = 150, avg = 0;
+  unsigned long lastBeat = 0;
+  for (;;) {
+    int lo = 4095, hi = 0;
+    for (int k = 0; k < 20; k++) {   // ca. 20 ms lang messen, zwischendurch Pause
+      for (int i = 0; i < 20; i++) {
+        int v = analogRead(MIC_PIN);
+        lo = min(lo, v);
+        hi = max(hi, v);
+      }
+      vTaskDelay(1);
+    }
+    float swing = hi - lo;
+    loudest = max(swing, max(150.0f, loudest * 0.997f));  // lautester Wert der letzten Sekunden
+    float level = swing / loudest;
+    micLevel = level;
+    avg = avg * 0.95f + level * 0.05f;
+    if (level > 0.35f && level > avg * 1.5f && millis() - lastBeat > 180) {
+      lastBeat = millis();
+      micBeats++;
+    }
+  }
 }
 
 float sparkStart[ROWS][COLS];
@@ -313,6 +349,37 @@ void renderEffect() {
         }
       }
       break;
+    case 7: {  // Musik: Puls – die Effekt-Farbe wird mit der Musik hell und dunkel
+      static float shown = 0;
+      shown = max((float)micLevel, shown * 0.85f);
+      fillFrame(scaled(fxColor, 0.03f + 0.97f * shown));
+      break;
+    }
+    case 8: {  // Musik: Pegel – Balken von unten, grün -> gelb -> rot
+      static float shown = 0;
+      shown = max((float)micLevel, shown * 0.9f);
+      float height = shown * ROWS;
+      for (int r = 0; r < ROWS; r++) {
+        int fromBottom = ROWS - 1 - r;
+        CRGB c = hue(0.33f * (1 - (float)fromBottom / (ROWS - 1)));
+        float v = constrain(height - fromBottom, 0.0f, 1.0f);
+        for (int col = 0; col < COLS; col++) frame[r][col] = scaled(c, v);
+      }
+      break;
+    }
+    case 9: {  // Musik: Beat-Farben – bei jedem Schlag eine neue Farbe, dann ausklingen
+      static uint32_t seen = 0;
+      static float glow = 0;
+      static CRGB col = RED;
+      if (micBeats != seen) {
+        seen = micBeats;
+        col = hue(random(1000) / 1000.0f);
+        glow = 1;
+      }
+      glow = max(0.15f, glow * 0.88f);
+      fillFrame(scaled(col, glow));
+      break;
+    }
     case WIRING_TEST: {  // Reihe für Reihe von oben nach unten, oberster Kasten rot
       fillFrame(BLACK);
       int step = (int)(t * 2) % (COLS * ROWS);
@@ -543,6 +610,8 @@ void setup() {
     for (int c = 0; c < COLS; c++) sparkStart[r][c] = -10;
   addLeds();
   loadState();
+  analogSetPinAttenuation(MIC_PIN, ADC_11db);
+  xTaskCreatePinnedToCore(micTask, "mic", 3072, nullptr, 1, nullptr, 0);
   memcpy(frame, boxes, sizeof(frame));  // sofort weiß
   shownBrightness = brightness;
   showAll();

@@ -79,7 +79,7 @@
   <section>
     <div id="grid"></div>
     <p id="hint">Tippen oder wischen, um Kästen zu färben.</p>
-    <p style="opacity:.4;font-size:11px;margin:0">Version 8</p>
+    <p style="opacity:.4;font-size:11px;margin:0">Version 9</p>
   </section>
 
   <section>
@@ -100,6 +100,12 @@
     </div>
     <label>Tempo <span id="sval"></span></label>
     <input type="range" id="speed" min="0.1" max="5" step="0.1" value="1">
+  </section>
+
+  <section>
+    <h2>Musik</h2>
+    <div class="fx" id="music"></div>
+    <p style="color:var(--muted);font-size:14px;margin:8px 0 0">Die Decke hört über das Mikrofon mit. Farbe für Puls: oben bei „Farbe“ wählen.</p>
   </section>
 
   <section>
@@ -166,7 +172,8 @@ const UUID = {
   scenes: "6e1d0004-8a3c-4c5b-9b1e-1ed0c0dec0de",
 };
 const EFFECTS = [["rainbow", "Regenbogen"], ["colorfade", "Farbwechsel"], ["wave", "Welle"],
-  ["breathe", "Atmen"], ["sparkle", "Funkeln"], ["rain", "Regen"], ["wiring_test", "Verkabelungstest"]]
+  ["breathe", "Atmen"], ["sparkle", "Funkeln"], ["rain", "Regen"], ["wiring_test", "Verkabelungstest"],
+  ["music_pulse", "Puls"], ["music_vu", "Pegel"], ["music_beat", "Beat-Farben"]]
   .map(([id, name]) => ({ id, name }));
 let ble = null, sceneNames = [], bleChain = Promise.resolve();
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -286,15 +293,16 @@ function render() {
     ? "Effekt läuft – tippe auf einen Kasten, um zu deinem Muster zurückzukehren."
     : "Tippen oder wischen, um Kästen zu färben.";
 
-  const fx = $("fx");
+  const fx = $("fx"), music = $("music");
   if (fx.children.length === 1) {
     S.effects.forEach((e) => {
       const b = document.createElement("button");
       b.dataset.mode = e.id; b.textContent = e.name;
-      fx.appendChild(b);
+      (e.id.startsWith("music_") ? music : fx).appendChild(b);
     });
   }
-  fx.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.mode === S.mode));
+  document.querySelectorAll("#fx button, #music button")
+    .forEach((b) => b.classList.toggle("on", b.dataset.mode === S.mode));
 
   const br = $("bright");
   br.max = S.max_brightness;
@@ -386,11 +394,13 @@ $("speed").addEventListener("input", (e) => {
   clearTimeout(spTimer);
   spTimer = setTimeout(() => api("POST", "/api/settings", { speed: +e.target.value }).then(update), 80);
 });
-$("fx").addEventListener("click", async (e) => {
+async function pickEffect(e) {
   const b = e.target.closest("button");
   if (!b) return;
   update(await api("POST", "/api/settings", { mode: b.dataset.mode, color }));
-});
+}
+$("fx").addEventListener("click", pickEffect);
+$("music").addEventListener("click", pickEffect);
 $("saveScene").onclick = async () => {
   const name = (prompt("Name der Szene:") || "").trim();
   if (name) update(await api("POST", "/api/scenes/" + encodeURIComponent(name)));
