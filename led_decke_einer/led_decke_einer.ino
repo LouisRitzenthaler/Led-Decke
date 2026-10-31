@@ -25,6 +25,9 @@
 #define ROWS 9    // Kästen pro Reihe
 #define LEDS_PER_STRIP 83
 
+// LEDs pro Kasten, vom Anfang des Streifens aus gezählt (zusammen 83)
+const uint8_t BOX_LEDS[ROWS] = {8, 10, 10, 9, 9, 9, 10, 9, 9};
+
 // Datenpins: pro Reihe 1..7 ein Pin für Streifen A und einer für Streifen B
 const uint8_t PIN_A[COLS] = {16, 18, 21, 23, 26, 32, 4};
 const uint8_t PIN_B[COLS] = {17, 19, 22, 25, 27, 33, 13};
@@ -81,7 +84,7 @@ uint8_t stripCol[NUM_STRIPS];
 uint16_t boxFirst[NUM_STRIPS][ROWS];  // erste LED des Kastens
 uint16_t boxCount[NUM_STRIPS][ROWS];  // Anzahl LEDs im Kasten
 
-// Streifen gleichmäßig auf die Kästen verteilen (83 LEDs / 9 Kästen -> 9 oder 10)
+// Streifen nach BOX_LEDS auf die Kästen verteilen
 void addLeds() {
   for (int k = 0; k < NUM_STRIPS; k++) {
     int col = k % COLS;
@@ -89,12 +92,12 @@ void addLeds() {
     stripCol[k] = col;
     strips[k] = new Adafruit_NeoPixel(LEDS_PER_STRIP, isA ? PIN_A[col] : PIN_B[col], LED_PIXEL_TYPE + NEO_KHZ800);
     bool down = isA ? A_STARTS_AT_TOP[col] : B_STARTS_AT_TOP[col];
+    int from = 0;
     for (int i = 0; i < ROWS; i++) {
-      int from = (i * LEDS_PER_STRIP + ROWS / 2) / ROWS;
-      int to = ((i + 1) * LEDS_PER_STRIP + ROWS / 2) / ROWS;
       int row = down ? i : ROWS - 1 - i;
       boxFirst[k][row] = from;
-      boxCount[k][row] = to - from;
+      boxCount[k][row] = min(BOX_LEDS[i], (uint8_t)max(0, LEDS_PER_STRIP - from));
+      from += BOX_LEDS[i];
     }
     strips[k]->begin();
   }
