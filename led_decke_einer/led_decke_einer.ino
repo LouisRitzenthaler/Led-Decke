@@ -273,7 +273,7 @@ void fillFrame(CRGB c) {
 //  Mikrofon: läuft nebenher und misst, wie laut es gerade ist.
 //  Die Empfindlichkeit passt sich von selbst an (leise Musik = trotzdem volle Wirkung).
 // ---------------------------------------------------------------------
-volatile float micLevel = 0;      // 0..1, wie laut gerade (alle Töne)
+volatile float micLevel = 0;      // 0..1, wie stark der Bass gerade ist
 volatile uint32_t micBeats = 0;   // zählt die Bass-Schläge
 
 // Misst immer 16 ms lang mit 4000 Messungen pro Sekunde, dann 4 ms Pause.
@@ -283,19 +283,15 @@ void micTask(void *) {
   const int N = 64;                 // Messungen pro Runde
   const float A = 0.15f;            // Filter-Stärke für ca. 100 Hz bei 4000 Messungen/s
   float dc = 2000, lp1 = 0, lp2 = 0, lp3 = 0, lp4 = 0;
-  float loudest = 300, noise = 100;           // für micLevel
   float bassAvg = 0, bassQuiet = 50, bassPeak = 0, prevBass = 0;
   unsigned long lastBeat = 0;
   for (;;) {
-    int lo = 4095, hi = 0;
     float bass = 0;
     unsigned long next = micros();
     for (int i = 0; i < N; i++) {
       while ((long)(micros() - next) < 0) {}
       next += 250;
       int v = analogRead(MIC_PIN);
-      lo = min(lo, v);
-      hi = max(hi, v);
       dc += (v - dc) * 0.002f;      // Mittelwert (Ruhelage) langsam mitlaufen lassen
       lp1 += A * ((v - dc) - lp1);
       lp2 += A * (lp1 - lp2);
@@ -306,16 +302,15 @@ void micTask(void *) {
     bass = sqrtf(bass / N);         // Bass-Stärke dieser Runde
     vTaskDelay(4);
 
-    // Lautstärke für Puls und Pegel (Grundrauschen der Stille abziehen)
-    float swing = hi - lo;
-    noise = swing < noise ? noise * 0.9f + swing * 0.1f : noise * 0.999f + swing * 0.001f;
-    float sig = max(0.0f, swing - noise * 1.5f - 40);
-    loudest = max(sig, max(300.0f, loudest * 0.997f));
-    micLevel = sig / loudest;
+    // Grundrauschen der Stille und stärksten Bass der letzten Sekunden mitlernen
+    bassQuiet = bass < bassQuiet ? bassQuiet * 0.9f + bass * 0.1f : bassQuiet * 0.999f + bass * 0.001f;
+    bassPeak = max(bass, bassPeak * 0.995f);
+
+    // Bass-Stärke für Puls und Pegel: 0 = Stille, 1 = so stark wie der stärkste Bass zuletzt
+    float floor0 = bassQuiet * 2.5f + 15;
+    micLevel = constrain((bass - floor0) / max(30.0f, bassPeak - floor0), 0.0f, 1.0f);
 
     // Bass-Schlag erkennen
-    bassQuiet = bass < bassQuiet ? bassQuiet * 0.9f + bass * 0.1f : bassQuiet * 0.999f + bass * 0.001f;
-    bassPeak = max(bass, bassPeak * 0.995f);   // stärkster Bass der letzten Sekunden
     bool rising = bass > prevBass * 1.15f;
     if (rising && bass > bassAvg * 1.4f && bass > bassQuiet * 2.5f + 15 && bass > bassPeak * 0.4f &&
         millis() - lastBeat > 250) {
