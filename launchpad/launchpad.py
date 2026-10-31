@@ -17,6 +17,7 @@ die Kästen auf dem Launchpad langsam blau und Tasten tun nichts. Danach zeigt
 es genau das, was die Decke gerade macht.
 """
 import json
+import os
 import math
 import queue
 import socket
@@ -481,11 +482,11 @@ def main():
                 last_check = now
                 if not lp.still_there():   # neu eingesteckt -> Dienst startet neu und verbindet sich
                     print("Launchpad abgesteckt, starte neu", flush=True)
-                    sys.exit(1)
+                    os._exit(1)   # sofort beenden, systemd startet neu (sys.exit kann hängen bleiben)
             if chef.ever_online and now - max(chef.last_ok, started) > 45:
                 # Decke war da und ist seit 45 s weg: Programm neu starten (frische Bluetooth-Verbindung)
                 print("Decke weg, starte neu", flush=True)
-                sys.exit(1)
+                os._exit(1)   # sofort beenden, systemd startet neu (sys.exit kann hängen bleiben)
             if not chef.synced():          # warten, bis die Decke ihren Zustand geschickt hat
                 if now - last_warn > 30:
                     last_warn = now
@@ -529,7 +530,7 @@ def main():
         except OSError as e:           # Launchpad abgesteckt o. Ä. -> Dienst startet neu
             print("Fehler:", e, flush=True)
             time.sleep(2)
-            sys.exit(1)
+            os._exit(1)   # sofort beenden, systemd startet neu (sys.exit kann hängen bleiben)
 
 
 if __name__ == "__main__":

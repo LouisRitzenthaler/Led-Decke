@@ -9,6 +9,7 @@
 #include <ArduinoOTA.h>
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
+#include <Update.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -136,16 +137,16 @@ void showAll() {
 
 // ---------------------------------------------------------------------
 //  WLAN: Updates (Arduino IDE oder Browser http://IP/update) und Launchpad.
-//  Das WLAN-Suchen stört Bluetooth stark. Deshalb: Ist das WLAN 2 Minuten nach
-//  dem Einschalten nicht da (oder 1 Minute weg), wird es ganz abgeschaltet.
-//  Für ein Update: Hotspot an, dann die Decke einmal aus- und einschalten.
+//  WLAN stört Bluetooth stark. Deshalb ist es nur in den ersten 3 Minuten nach
+//  dem Einschalten an (für Updates), danach immer aus.
+//  Für ein Update: Hotspot an, Decke aus- und einschalten, dann hochladen.
 // ---------------------------------------------------------------------
 WebServer web(80);
 HTTPUpdateServer webUpdater;
 bool otaStarted = false;
 void bluetoothPause(bool pause);
 unsigned long lastWifiTry = 0;
-unsigned long wifiUntil = 120000;  // so lange (ms seit Start) darf das WLAN suchen
+const unsigned long WIFI_MINUTES = 3;  // so lange nach dem Einschalten ist das WLAN an
 bool wifiOff = false;
 
 void startWifi() {
@@ -164,19 +165,20 @@ void startWifi() {
 // In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
 void handleNetwork() {
   if (wifiOff) return;
+  if (millis() > WIFI_MINUTES * 60000 && !Update.isRunning()) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiOff = true;
+    Serial.println("WLAN aus (nur noch Bluetooth)");
+    return;
+  }
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() > wifiUntil) {
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      wifiOff = true;
-      Serial.println("WLAN aus (nur Bluetooth)");
-    } else if (millis() - lastWifiTry > 15000) {
+    if (millis() - lastWifiTry > 15000) {
       lastWifiTry = millis();
       WiFi.reconnect();
     }
     return;
   }
-  wifiUntil = millis() + 60000;
   if (!otaStarted) {
     otaStarted = true;
     ArduinoOTA.setHostname(HOSTNAME);
@@ -271,34 +273,57 @@ void fillFrame(CRGB c) {
 //  Mikrofon: läuft nebenher und misst, wie laut es gerade ist.
 //  Die Empfindlichkeit passt sich von selbst an (leise Musik = trotzdem volle Wirkung).
 // ---------------------------------------------------------------------
-volatile float micLevel = 0;      // 0..1
-volatile uint32_t micBeats = 0;   // zählt die Schläge (Bass, Klatschen ...)
+volatile float micLevel = 0;      // 0..1, wie laut gerade (alle Töne)
+volatile uint32_t micBeats = 0;   // zählt die Bass-Schläge
 
+// Misst immer 16 ms lang mit 4000 Messungen pro Sekunde, dann 4 ms Pause.
+// Ein Tiefpass-Filter lässt nur den Bass (unter ca. 100 Hz) durch; ein Schlag
+// ist, wenn die Bass-Energie plötzlich deutlich über ihrem Durchschnitt liegt.
 void micTask(void *) {
-  float loudest = 300, avg = 0, noise = 100;
+  const int N = 64;                 // Messungen pro Runde
+  const float A = 0.15f;            // Filter-Stärke für ca. 100 Hz bei 4000 Messungen/s
+  float dc = 2000, lp1 = 0, lp2 = 0, lp3 = 0, lp4 = 0;
+  float loudest = 300, noise = 100;           // für micLevel
+  float bassAvg = 0, bassQuiet = 50, bassPeak = 0, prevBass = 0;
   unsigned long lastBeat = 0;
   for (;;) {
     int lo = 4095, hi = 0;
-    for (int k = 0; k < 20; k++) {   // ca. 20 ms lang messen, zwischendurch Pause
-      for (int i = 0; i < 20; i++) {
-        int v = analogRead(MIC_PIN);
-        lo = min(lo, v);
-        hi = max(hi, v);
-      }
-      vTaskDelay(1);
+    float bass = 0;
+    unsigned long next = micros();
+    for (int i = 0; i < N; i++) {
+      while ((long)(micros() - next) < 0) {}
+      next += 250;
+      int v = analogRead(MIC_PIN);
+      lo = min(lo, v);
+      hi = max(hi, v);
+      dc += (v - dc) * 0.002f;      // Mittelwert (Ruhelage) langsam mitlaufen lassen
+      lp1 += A * ((v - dc) - lp1);
+      lp2 += A * (lp1 - lp2);
+      lp3 += A * (lp2 - lp3);
+      lp4 += A * (lp3 - lp4);
+      bass += lp4 * lp4;
     }
+    bass = sqrtf(bass / N);         // Bass-Stärke dieser Runde
+    vTaskDelay(4);
+
+    // Lautstärke für Puls und Pegel (Grundrauschen der Stille abziehen)
     float swing = hi - lo;
-    // Grundrauschen (Stille) mitlernen: sinkt schnell, steigt nur ganz langsam
     noise = swing < noise ? noise * 0.9f + swing * 0.1f : noise * 0.999f + swing * 0.001f;
-    float sig = max(0.0f, swing - noise * 1.5f - 40);        // nur was deutlich über dem Rauschen liegt
-    loudest = max(sig, max(300.0f, loudest * 0.997f));       // lautester Wert der letzten Sekunden
-    float level = sig / loudest;
-    micLevel = level;
-    avg = avg * 0.95f + level * 0.05f;
-    if (sig > 150 && level > 0.45f && level > avg * 1.6f && millis() - lastBeat > 180) {
+    float sig = max(0.0f, swing - noise * 1.5f - 40);
+    loudest = max(sig, max(300.0f, loudest * 0.997f));
+    micLevel = sig / loudest;
+
+    // Bass-Schlag erkennen
+    bassQuiet = bass < bassQuiet ? bassQuiet * 0.9f + bass * 0.1f : bassQuiet * 0.999f + bass * 0.001f;
+    bassPeak = max(bass, bassPeak * 0.995f);   // stärkster Bass der letzten Sekunden
+    bool rising = bass > prevBass * 1.15f;
+    if (rising && bass > bassAvg * 1.4f && bass > bassQuiet * 2.5f + 15 && bass > bassPeak * 0.4f &&
+        millis() - lastBeat > 250) {
       lastBeat = millis();
       micBeats++;
     }
+    bassAvg = bassAvg * 0.9f + bass * 0.1f;
+    prevBass = bass;
   }
 }
 
@@ -370,17 +395,16 @@ void renderEffect() {
       }
       break;
     }
-    case 9: {  // Musik: Beat-Farben – bei jedem Schlag eine neue Farbe, dann ausklingen
+    case 9: {  // Musik: Beat-Farben – bei jedem Bass-Schlag sofort eine neue Farbe
       static uint32_t seen = 0;
-      static float glow = 0;
-      static CRGB col = RED;
+      static float glow = 1, h = 0;
       if (micBeats != seen) {
         seen = micBeats;
-        col = hue(random(1000) / 1000.0f);
+        h += 0.2f + random(600) / 1000.0f;   // deutlich andere Farbe als vorher
         glow = 1;
       }
-      glow = max(0.15f, glow * 0.88f);
-      fillFrame(scaled(col, glow));
+      glow = max(0.6f, glow * 0.92f);        // kurz heller beim Schlag, dann ruhig
+      fillFrame(hue(h, 255, 255 * glow));
       break;
     }
     case WIRING_TEST: {  // Reihe für Reihe von oben nach unten, oberster Kasten rot
