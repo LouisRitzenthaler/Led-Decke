@@ -79,6 +79,7 @@
   <section>
     <div id="grid"></div>
     <p id="hint">Tippen oder wischen, um Kästen zu färben.</p>
+    <p style="opacity:.4;font-size:11px;margin:0">Version 8</p>
   </section>
 
   <section>
@@ -265,8 +266,8 @@ function buildGrid() {
   for (let r = 0; r < S.rows; r++)
     for (let c = 0; c < S.cols; c++) {
       const d = document.createElement("div");
-      // oben/unten gedreht, damit das Raster aussieht wie die Decke
-      d.className = "cell"; d.dataset.r = S.rows - 1 - r; d.dataset.c = c;
+      // links/rechts gespiegelt wie das Launchpad, damit das Raster aussieht wie die Decke
+      d.className = "cell"; d.dataset.r = r; d.dataset.c = S.cols - 1 - c;
       g.appendChild(d);
     }
 }
