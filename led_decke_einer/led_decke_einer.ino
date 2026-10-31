@@ -275,7 +275,7 @@ volatile float micLevel = 0;      // 0..1
 volatile uint32_t micBeats = 0;   // zählt die Schläge (Bass, Klatschen ...)
 
 void micTask(void *) {
-  float loudest = 150, avg = 0;
+  float loudest = 300, avg = 0, noise = 100;
   unsigned long lastBeat = 0;
   for (;;) {
     int lo = 4095, hi = 0;
@@ -288,11 +288,14 @@ void micTask(void *) {
       vTaskDelay(1);
     }
     float swing = hi - lo;
-    loudest = max(swing, max(150.0f, loudest * 0.997f));  // lautester Wert der letzten Sekunden
-    float level = swing / loudest;
+    // Grundrauschen (Stille) mitlernen: sinkt schnell, steigt nur ganz langsam
+    noise = swing < noise ? noise * 0.9f + swing * 0.1f : noise * 0.999f + swing * 0.001f;
+    float sig = max(0.0f, swing - noise * 1.5f - 40);        // nur was deutlich über dem Rauschen liegt
+    loudest = max(sig, max(300.0f, loudest * 0.997f));       // lautester Wert der letzten Sekunden
+    float level = sig / loudest;
     micLevel = level;
     avg = avg * 0.95f + level * 0.05f;
-    if (level > 0.35f && level > avg * 1.5f && millis() - lastBeat > 180) {
+    if (sig > 150 && level > 0.45f && level > avg * 1.6f && millis() - lastBeat > 180) {
       lastBeat = millis();
       micBeats++;
     }
