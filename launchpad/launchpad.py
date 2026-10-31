@@ -226,6 +226,7 @@ class BleChef:
                     lambda d, ad: d.name == BLE_NAME or BLE_SERVICE in (ad.service_uuids or []),
                     timeout=10)
                 if dev is None:
+                    print("Decke per Bluetooth nicht gefunden, suche weiter", flush=True)
                     continue
                 async with BleakClient(dev) as client:
                     print("Decke per Bluetooth verbunden", flush=True)

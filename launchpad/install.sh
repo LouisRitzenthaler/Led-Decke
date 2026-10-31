@@ -36,6 +36,8 @@ for CFG in /boot/firmware/config.txt /boot/config.txt; do
 done
 sudo apt-get install -y pi-bluetooth || true
 sudo rfkill unblock bluetooth || true
+# Bluetooth beim Start immer einschalten
+[ -f /etc/bluetooth/main.conf ] && sudo sed -i 's/^#\?AutoEnable=.*/AutoEnable=true/' /etc/bluetooth/main.conf
 sudo systemctl enable --now bluetooth || true
 
 # Das WLAN, in dem der Pi gerade ist (der Hotspot), beim Start bevorzugen
