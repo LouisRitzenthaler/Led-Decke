@@ -228,14 +228,14 @@ class BleChef:
                 if dev is None:
                     print("Decke per Bluetooth nicht gefunden, suche weiter", flush=True)
                     continue
-                async with BleakClient(dev) as client:
+                async with BleakClient(dev, timeout=15) as client:
                     print("Decke per Bluetooth verbunden", flush=True)
                     while not self.todo.empty():   # alte Tasten von vor der Verbindung vergessen
                         self.todo.get_nowait()
                     self.pending = None
                     await self._talk(client)
-            except Exception as e:     # Bluetooth-Fehler: kurz warten, neu verbinden
-                print("Bluetooth:", e, flush=True)
+            except Exception as e:     # Bluetooth-Fehler (z. B. Decke aus): kurz warten, neu verbinden
+                print("Bluetooth:", type(e).__name__, e, flush=True)
             self.online = False
             self.last_ok = 0
             await asyncio.sleep(1)
@@ -254,8 +254,9 @@ class BleChef:
                 except queue.Empty:
                     pass
             if self.pending is not None:    # bleibt gemerkt, bis er sicher angekommen ist
-                await client.write_gatt_char(BLE_CMD, json.dumps(self.pending, separators=(",", ":")).encode(),
-                                             response=True)
+                data = json.dumps(self.pending, separators=(",", ":")).encode()
+                # Ist die Decke plötzlich weg (Strom aus), nicht ewig warten
+                await asyncio.wait_for(client.write_gatt_char(BLE_CMD, data, response=True), 3)
                 self.pending = None
                 continue
             if time.monotonic() - last_read >= POLL:
@@ -265,7 +266,7 @@ class BleChef:
                 await asyncio.sleep(0.01)
 
     async def _read(self, client):
-        data = bytes(await client.read_gatt_char(BLE_STATE))
+        data = bytes(await asyncio.wait_for(client.read_gatt_char(BLE_STATE), 3))
         st = parse_state(data)
         if st is None:
             print("Zustand der Decke unlesbar (%d Bytes)" % len(data), flush=True)
@@ -453,6 +454,7 @@ def main():
             deselect_at = None
 
     last_warn = time.monotonic() - 25
+    started = time.monotonic()
     last_check = 0
     while True:
         try:
@@ -479,6 +481,10 @@ def main():
                 if not lp.still_there():   # neu eingesteckt -> Dienst startet neu und verbindet sich
                     print("Launchpad abgesteckt, starte neu", flush=True)
                     sys.exit(1)
+            if chef.ever_online and now - max(chef.last_ok, started) > 45:
+                # Decke war da und ist seit 45 s weg: Programm neu starten (frische Bluetooth-Verbindung)
+                print("Decke weg, starte neu", flush=True)
+                sys.exit(1)
             if not chef.synced():          # warten, bis die Decke ihren Zustand geschickt hat
                 if now - last_warn > 30:
                     last_warn = now

@@ -532,8 +532,11 @@ void setup() {
     for (int c = 0; c < COLS; c++) sparkStart[r][c] = -10;
   addLeds();
   loadState();
+  memcpy(frame, boxes, sizeof(frame));  // sofort weiß
+  shownBrightness = brightness;
+  showAll();
+  startBle();  // Bluetooth zuerst, damit Pi und Handy nicht auf das WLAN warten
   startWifi();
-  startBle();
   Serial.printf("\nLED-Decke: 14 Streifen x %d LEDs\n", LEDS_PER_STRIP);
 }
 
