@@ -59,6 +59,12 @@
   .chip { display: inline-flex; align-items: center; gap: 6px; padding: 8px 10px; }
   .chip .x { color: var(--muted); padding-left: 4px; }
   #ble { display: none; }
+  .microw { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 14px; color: var(--muted); }
+  .micbar { flex: 1; height: 14px; border-radius: 7px; background: #2a2f3a; overflow: hidden; }
+  .micbar div { height: 100%; width: 0; background: var(--accent); transition: width .1s; }
+  .micdot { width: 18px; height: 18px; border-radius: 50%; background: #2a2f3a; }
+  .micdot.hit { background: #ff3b3b; }
+  #micInfo { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
   #ble p { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
   #ble button { width: 100%; }
   #err { display: none; background: #5a2a2a; padding: 10px 12px; border-radius: 10px; margin-bottom: 12px; }
@@ -79,7 +85,7 @@
   <section>
     <div id="grid"></div>
     <p id="hint">Tippen oder wischen, um Kästen zu färben.</p>
-    <p style="opacity:.4;font-size:11px;margin:0">Version 9</p>
+    <p style="opacity:.4;font-size:11px;margin:0">Version 10</p>
   </section>
 
   <section>
@@ -105,6 +111,12 @@
   <section>
     <h2>Musik</h2>
     <div class="fx" id="music"></div>
+    <div id="mic" style="display:none">
+      <div class="microw">Bass <div class="micbar"><div id="micBar"></div></div><span class="micdot" id="micDot" title="Bass-Schlag"></span></div>
+      <p id="micInfo"></p>
+      <label>Empfindlichkeit <span id="senval"></span></label>
+      <input type="range" id="sens" min="1" max="10" step="1" value="6">
+    </div>
     <p style="color:var(--muted);font-size:14px;margin:8px 0 0">Die Decke hört über das Mikrofon mit. Farbe für Puls: oben bei „Farbe“ wählen.</p>
   </section>
 
@@ -170,10 +182,12 @@ const UUID = {
   cmd: "6e1d0002-8a3c-4c5b-9b1e-1ed0c0dec0de",
   state: "6e1d0003-8a3c-4c5b-9b1e-1ed0c0dec0de",
   scenes: "6e1d0004-8a3c-4c5b-9b1e-1ed0c0dec0de",
+  mic: "6e1d0005-8a3c-4c5b-9b1e-1ed0c0dec0de",
 };
 const EFFECTS = [["rainbow", "Regenbogen"], ["colorfade", "Farbwechsel"], ["wave", "Welle"],
   ["breathe", "Atmen"], ["sparkle", "Funkeln"], ["rain", "Regen"], ["wiring_test", "Verkabelungstest"],
-  ["music_pulse", "Puls"], ["music_vu", "Pegel"], ["music_beat", "Beat-Farben"]]
+  ["music_pulse", "Puls"], ["music_vu", "Pegel"], ["music_beat", "Beat-Farben"],
+  ["music_switch", "Bass-Wechsel"]]
   .map(([id, name]) => ({ id, name }));
 let ble = null, sceneNames = [], bleChain = Promise.resolve();
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -228,6 +242,7 @@ async function bleAttach(device) {
   }
   const c = {};
   for (const k of ["cmd", "state", "scenes"]) c[k] = await svc.getCharacteristic(UUID[k]);
+  try { c.mic = await svc.getCharacteristic(UUID.mic); } catch (e) { c.mic = null; }  // ältere Firmware hat keine Anzeige
   ble = { device, ...c };
   await bleReadScenes();
   update(await bleApi("GET", "/api/state"));
@@ -406,9 +421,39 @@ $("saveScene").onclick = async () => {
   if (name) update(await api("POST", "/api/scenes/" + encodeURIComponent(name)));
 };
 
+// --- Mikrofon-Anzeige (nur während ein Musik-Effekt läuft) -----------------
+let lastBeats = -1, dotTimer = null;
+async function pollMic() {
+  const show = !!(ble && ble.mic && S && S.mode.startsWith("music_"));
+  $("mic").style.display = show ? "" : "none";
+  if (!show) return;
+  const v = await bleOp(() => ble.mic.readValue());
+  const sens = v.getUint8(1), level = v.getUint8(2) / 255, beats = v.getUint8(3);
+  const rmin = v.getUint16(4, true), rmax = v.getUint16(6, true);
+  const bass = v.getUint16(8, true) / 10, gate = v.getUint16(10, true) / 10;
+  $("micBar").style.width = Math.round(level * 100) + "%";
+  if (lastBeats >= 0 && beats !== lastBeats) {
+    $("micDot").classList.add("hit");
+    clearTimeout(dotTimer);
+    dotTimer = setTimeout(() => $("micDot").classList.remove("hit"), 150);
+  }
+  lastBeats = beats;
+  if (document.activeElement !== $("sens")) $("sens").value = sens;
+  $("senval").textContent = $("sens").value;
+  const note = rmax - rmin < 40 ? " – Mikrofon liefert kaum Signal (Kabel an GPIO 34?)" : "";
+  $("micInfo").textContent = `Signal ${rmin}–${rmax} · Bass ${bass.toFixed(1)} · Schwelle ${gate.toFixed(1)}${note}`;
+}
+let seTimer = null;
+$("sens").addEventListener("input", (e) => {
+  $("senval").textContent = e.target.value;
+  clearTimeout(seTimer);
+  seTimer = setTimeout(() => api("POST", "/api/settings", { mic_sens: +e.target.value }).then(update), 150);
+});
+
 // --- Abgleich mit dem Pi (auch wenn mehrere Handys steuern) ----------------
 async function poll() {
   if ((!USE_BLE || ble) && !painting && !pending.size && !flushTimer) update(await api("GET", "/api/state"));
+  try { await pollMic(); } catch (e) {}
   // Oft nachfragen, damit Änderungen vom Launchpad sofort zu sehen sind
   const live = S && S.mode !== "static";
   setTimeout(poll, live ? 200 : 400);

@@ -51,6 +51,7 @@ const bool B_STARTS_AT_TOP[COLS] = {true, true, true, true, true, true, true};
 #define BLE_CMD_UUID     "6e1d0002-8a3c-4c5b-9b1e-1ed0c0dec0de"  // schreiben: JSON-Befehl
 #define BLE_STATE_UUID   "6e1d0003-8a3c-4c5b-9b1e-1ed0c0dec0de"  // lesen: Zustand (binär)
 #define BLE_SCENES_UUID  "6e1d0004-8a3c-4c5b-9b1e-1ed0c0dec0de"  // lesen: Szenen-Namen (JSON)
+#define BLE_MIC_UUID     "6e1d0005-8a3c-4c5b-9b1e-1ed0c0dec0de"  // lesen: Mikrofon-Anzeige (binär)
 
 // ---------------------------------------------------------------------
 //  Farben
@@ -218,15 +219,16 @@ struct Scene {
 Scene scenes[MAX_SCENES];
 
 const char *EFFECT_IDS[] = {"rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test",
-                            "music_pulse", "music_vu", "music_beat"};
+                            "music_pulse", "music_vu", "music_beat", "music_switch"};
 const char *EFFECT_NAMES[] = {"Regenbogen", "Farbwechsel", "Welle", "Atmen", "Funkeln", "Regen", "Verkabelungstest",
-                              "Puls", "Pegel", "Beat-Farben"};
+                              "Puls", "Pegel", "Beat-Farben", "Bass-Wechsel"};
 const int NUM_EFFECTS = sizeof(EFFECT_IDS) / sizeof(EFFECT_IDS[0]);
 const int WIRING_TEST = 6;
 
 Preferences prefs;
 bool dirty = false, scenesDirty = false;
 unsigned long lastSave = 0;
+volatile int micSens = 6;  // Mikrofon-Empfindlichkeit 1 (wenig) .. 10 (sehr empfindlich)
 
 // Nach dem Einschalten ist die Decke immer ganz weiß (halbe Helligkeit, kein Effekt).
 // Nur die Szenen, das Tempo und die Effekt-Farbe bleiben gespeichert.
@@ -235,6 +237,7 @@ void loadState() {
   if (prefs.getBytesLength("scenes") == sizeof(scenes)) prefs.getBytes("scenes", scenes, sizeof(scenes));
   speed = constrain(prefs.getFloat("spd", 1.0), 0.1f, 5.0f);
   fxColor = CRGB(prefs.getUInt("col", 0xff6a00));
+  micSens = constrain(prefs.getInt("sens", 6), 1, 10);
   for (int r = 0; r < ROWS; r++)
     for (int c = 0; c < COLS; c++) boxes[r][c] = WHITE;
   brightness = MAX_BRIGHTNESS / 2;
@@ -244,6 +247,7 @@ void loadState() {
 void saveState() {
   prefs.putFloat("spd", speed);
   prefs.putUInt("col", ((uint32_t)fxColor.r << 16) | (fxColor.g << 8) | fxColor.b);
+  prefs.putInt("sens", micSens);
   if (scenesDirty) {
     prefs.putBytes("scenes", scenes, sizeof(scenes));
     scenesDirty = false;
@@ -270,55 +274,83 @@ void fillFrame(CRGB c) {
 }
 
 // ---------------------------------------------------------------------
-//  Mikrofon: läuft nebenher und misst, wie laut es gerade ist.
-//  Die Empfindlichkeit passt sich von selbst an (leise Musik = trotzdem volle Wirkung).
+//  Mikrofon: läuft nebenher und hört nur auf den Bass.
+//  Vorgehen wie bei bewährten Beat-Erkennungen: Bass herausfiltern, Bass-Energie
+//  alle 24 ms messen, mit der letzten Sekunde vergleichen. Ein Schlag ist, wenn
+//  die Energie plötzlich deutlich über dem Durchschnitt liegt. Alle Schwellen
+//  passen sich von selbst an (leises oder schwaches Mikrofon geht trotzdem).
 // ---------------------------------------------------------------------
 volatile float micLevel = 0;      // 0..1, wie stark der Bass gerade ist
 volatile uint32_t micBeats = 0;   // zählt die Bass-Schläge
+volatile uint16_t micRawMin = 0, micRawMax = 0, micBass = 0, micGate = 0;  // für die Anzeige am Handy
 
-// Misst immer 16 ms lang mit 4000 Messungen pro Sekunde, dann 4 ms Pause.
-// Ein Tiefpass-Filter lässt nur den Bass (unter ca. 100 Hz) durch; ein Schlag
-// ist, wenn die Bass-Energie plötzlich deutlich über ihrem Durchschnitt liegt.
+// Tiefpass 2. Ordnung (Butterworth); zwei hintereinander lassen nur ca. 40–150 Hz durch
+struct Biquad {
+  float b0, b1, b2, a1, a2, z1 = 0, z2 = 0;
+  void lowpass(float fc, float fs) {
+    float w = 2 * PI * fc / fs, al = sinf(w) / (2 * 0.7071f), c = cosf(w), a0 = 1 + al;
+    b0 = (1 - c) / 2 / a0; b1 = (1 - c) / a0; b2 = b0; a1 = -2 * c / a0; a2 = (1 - al) / a0;
+  }
+  float run(float x) {
+    float y = b0 * x + z1;
+    z1 = b1 * x - a1 * y + z2;
+    z2 = b2 * x - a2 * y;
+    return y;
+  }
+};
+
 void micTask(void *) {
-  const int N = 64;                 // Messungen pro Runde
-  const float A = 0.15f;            // Filter-Stärke für ca. 100 Hz bei 4000 Messungen/s
-  float dc = 2000, lp1 = 0, lp2 = 0, lp3 = 0, lp4 = 0;
-  float bassAvg = 0, bassQuiet = 50, bassPeak = 0, prevBass = 0;
+  const int FS = 4000, N = 96, H = 36;   // 4000 Messungen/s, 24 ms pro Runde, 1 s Verlauf
+  Biquad f1, f2;
+  f1.lowpass(150, FS);
+  f2.lowpass(150, FS);
+  float dc = analogRead(MIC_PIN), hist[H] = {0}, quiet = 0.5f, peak = 1, prevE = 0;
+  int s1 = dc, s2 = dc, hi = 0, rounds = 0, rmin = 4095, rmax = 0, shown = 0;
   unsigned long lastBeat = 0;
   for (;;) {
-    float bass = 0;
+    float E = 0;
     unsigned long next = micros();
     for (int i = 0; i < N; i++) {
       while ((long)(micros() - next) < 0) {}
-      next += 250;
+      next += 1000000 / FS;
       int v = analogRead(MIC_PIN);
-      dc += (v - dc) * 0.002f;      // Mittelwert (Ruhelage) langsam mitlaufen lassen
-      lp1 += A * ((v - dc) - lp1);
-      lp2 += A * (lp1 - lp2);
-      lp3 += A * (lp2 - lp3);
-      lp4 += A * (lp3 - lp4);
-      bass += lp4 * lp4;
+      rmin = min(rmin, v); rmax = max(rmax, v);
+      int m = max(min(s1, s2), min(max(s1, s2), v));  // Mittel aus 3 Werten: entfernt Störspitzen
+      s1 = s2; s2 = v;
+      dc += (m - dc) * 0.002f;                           // Ruhelage langsam mitlaufen lassen
+      float y = f2.run(f1.run(m - dc));
+      E += y * y;
     }
-    bass = sqrtf(bass / N);         // Bass-Stärke dieser Runde
+    E /= N;
     vTaskDelay(4);
+    if (rounds < 1000) rounds++;
 
-    // Grundrauschen der Stille und stärksten Bass der letzten Sekunden mitlernen
-    bassQuiet = bass < bassQuiet ? bassQuiet * 0.9f + bass * 0.1f : bassQuiet * 0.999f + bass * 0.001f;
-    bassPeak = max(bass, bassPeak * 0.995f);
+    // Durchschnitt und Schwankung der letzten Sekunde
+    float avg = 0, var = 0;
+    for (int k = 0; k < H; k++) avg += hist[k];
+    avg /= H;
+    for (int k = 0; k < H; k++) var += (hist[k] - avg) * (hist[k] - avg);
+    float sd = sqrtf(var / H);
 
-    // Bass-Stärke für Puls und Pegel: 0 = Stille, 1 = so stark wie der stärkste Bass zuletzt
-    float floor0 = bassQuiet * 2.5f + 15;
-    micLevel = constrain((bass - floor0) / max(30.0f, bassPeak - floor0), 0.0f, 1.0f);
+    // Grundgeräusch (Median, passt sich in ein paar Sekunden an) und lautester Bass zuletzt
+    float u = rounds < 100 ? 0.06f : 0.02f;
+    quiet = max(0.5f, quiet * (E > quiet ? 1 + u : 1 - u));
+    peak = max(E, peak * 0.997f);
+    float gate = quiet * 9.0f * powf(0.84f, micSens - 1);  // Empfindlichkeit 6 -> 3,8-fach
 
-    // Bass-Schlag erkennen
-    bool rising = bass > prevBass * 1.15f;
-    if (rising && bass > bassAvg * 1.4f && bass > bassQuiet * 2.5f + 15 && bass > bassPeak * 0.4f &&
-        millis() - lastBeat > 250) {
+    if (rounds > H && E > gate && E > prevE && E > avg * 1.3f && E > avg + 1.2f * sd &&
+        millis() - lastBeat > 200) {
       lastBeat = millis();
       micBeats++;
     }
-    bassAvg = bassAvg * 0.9f + bass * 0.1f;
-    prevBass = bass;
+    micLevel = (E > gate && peak > gate * 1.5f) ? constrain(logf(E / gate) / logf(peak / gate), 0.0f, 1.0f) : 0;
+
+    hist[hi] = E; hi = (hi + 1) % H; prevE = E;
+    micBass = min(65535.0f, sqrtf(E) * 10); micGate = min(65535.0f, sqrtf(gate) * 10);
+    if (++shown >= 20) {  // Signal-Bereich für die Anzeige, ca. alle halbe Sekunde neu
+      micRawMin = rmin; micRawMax = rmax;
+      rmin = 4095; rmax = 0; shown = 0;
+    }
   }
 }
 
@@ -402,6 +434,18 @@ void renderEffect() {
       fillFrame(hue(h, 255, 255 * glow));
       break;
     }
+    case 10: {  // Musik: Bass-Wechsel – jeder Bass-Schlag schaltet sofort auf die nächste kräftige Farbe
+      static const CRGB COLORS[] = {CRGB(255, 0, 0), CRGB(0, 0, 255), CRGB(0, 255, 0), CRGB(255, 0, 180),
+                                    CRGB(255, 200, 0), CRGB(0, 220, 255), CRGB(140, 0, 255), CRGB(255, 80, 0)};
+      static uint32_t seen = 0;
+      static int i = 0;
+      if (micBeats != seen) {
+        seen = micBeats;
+        i = (i + 1 + random(6)) % 8;   // nie zweimal dieselbe Farbe
+      }
+      fillFrame(COLORS[i]);
+      break;
+    }
     case WIRING_TEST: {  // Reihe für Reihe von oben nach unten, oberster Kasten rot
       fillFrame(BLACK);
       int step = (int)(t * 2) % (COLS * ROWS);
@@ -453,6 +497,7 @@ const char *cmdSettings(JsonDocument &doc) {
   if (doc["brightness"].is<int>()) brightness = constrain(doc["brightness"].as<int>(), 0, MAX_BRIGHTNESS);
   if (doc["speed"].is<float>()) speed = constrain(doc["speed"].as<float>(), 0.1f, 5.0f);
   if (doc["color"].is<const char *>() && !parseHex(doc["color"], fxColor)) return "color";
+  if (doc["mic_sens"].is<int>()) micSens = constrain(doc["mic_sens"].as<int>(), 1, 10);
   if (doc["mode"].is<const char *>()) {
     const char *m = doc["mode"];
     int found = strcmp(m, "static") == 0 ? -1 : -2;
@@ -503,7 +548,7 @@ String sceneNamesJson() {  // Aufrufer hält den Lock
 // ---------------------------------------------------------------------
 //  Bluetooth (BLE)
 // ---------------------------------------------------------------------
-NimBLECharacteristic *bleState, *bleScenes;
+NimBLECharacteristic *bleState, *bleScenes, *bleMic;
 
 // Zustand binär: [1, mode, helligkeit, max, tempo*10, r,g,b, rows, cols, boxes..., frame...]
 const size_t STATE_SIZE = 10 + ROWS * COLS * 6;
@@ -547,6 +592,17 @@ class ScenesCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// Mikrofon-Anzeige: [1, Empfindlichkeit, Pegel 0..255, Schläge, Signal min, Signal max, Bass, Schwelle] (je 2 Byte)
+class MicCallbacks : public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    uint8_t b[12];
+    uint16_t w[4] = {micRawMin, micRawMax, micBass, micGate};
+    b[0] = 1; b[1] = micSens; b[2] = micLevel * 255; b[3] = micBeats & 0xff;
+    memcpy(b + 4, w, sizeof(w));
+    c->setValue(b, sizeof(b));
+  }
+};
+
 class CmdCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
     JsonDocument doc;
@@ -587,6 +643,8 @@ void startBle() {
   bleState->setCallbacks(new StateCallbacks());
   bleScenes = svc->createCharacteristic(BLE_SCENES_UUID, NIMBLE_PROPERTY::READ, 512);
   bleScenes->setCallbacks(new ScenesCallbacks());
+  bleMic = svc->createCharacteristic(BLE_MIC_UUID, NIMBLE_PROPERTY::READ, 16);
+  bleMic->setCallbacks(new MicCallbacks());
   svc->start();
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   adv->setName(BLE_NAME);
@@ -633,7 +691,7 @@ void setup() {
   addLeds();
   loadState();
   analogSetPinAttenuation(MIC_PIN, ADC_11db);
-  xTaskCreatePinnedToCore(micTask, "mic", 3072, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(micTask, "mic", 4096, nullptr, 1, nullptr, 0);
   memcpy(frame, boxes, sizeof(frame));  // sofort weiß
   shownBrightness = brightness;
   showAll();
