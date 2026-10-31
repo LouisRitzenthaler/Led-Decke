@@ -137,16 +137,17 @@ void showAll() {
 
 // ---------------------------------------------------------------------
 //  WLAN: Updates (Arduino IDE oder Browser http://IP/update) und Launchpad.
-//  WLAN stört Bluetooth stark. Deshalb ist es nur in den ersten 3 Minuten nach
-//  dem Einschalten an (für Updates), danach immer aus.
-//  Für ein Update: Hotspot an, Decke aus- und einschalten, dann hochladen.
+//  Das WLAN-Suchen stört Bluetooth. Deshalb: 2 Minuten nach dem Einschalten
+//  suchen; ist der Hotspot bis dahin nicht da, wird das WLAN abgeschaltet.
+//  Ist es einmal verbunden, bleibt es verbunden. Geht der Hotspot weg,
+//  wird wieder 2 Minuten gesucht und dann abgeschaltet.
 // ---------------------------------------------------------------------
 WebServer web(80);
 HTTPUpdateServer webUpdater;
 bool otaStarted = false;
 void bluetoothPause(bool pause);
 unsigned long lastWifiTry = 0;
-const unsigned long WIFI_MINUTES = 3;  // so lange nach dem Einschalten ist das WLAN an
+unsigned long wifiUntil = 120000;  // bis dahin (ms seit Start) darf das WLAN suchen
 bool wifiOff = false;
 
 void startWifi() {
@@ -165,20 +166,19 @@ void startWifi() {
 // In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
 void handleNetwork() {
   if (wifiOff) return;
-  if (millis() > WIFI_MINUTES * 60000 && !Update.isRunning()) {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    wifiOff = true;
-    Serial.println("WLAN aus (nur noch Bluetooth)");
-    return;
-  }
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiTry > 15000) {
+    if (millis() > wifiUntil && !Update.isRunning()) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      wifiOff = true;
+      Serial.println("Kein Hotspot - WLAN aus (nur noch Bluetooth)");
+    } else if (millis() - lastWifiTry > 15000) {
       lastWifiTry = millis();
       WiFi.reconnect();
     }
     return;
   }
+  wifiUntil = millis() + 120000;  // verbunden: bleibt an, bei Verlust 2 Minuten weitersuchen
   if (!otaStarted) {
     otaStarted = true;
     ArduinoOTA.setHostname(HOSTNAME);
