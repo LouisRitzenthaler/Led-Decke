@@ -219,9 +219,9 @@ struct Scene {
 Scene scenes[MAX_SCENES];
 
 const char *EFFECT_IDS[] = {"rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test",
-                            "music_pulse", "music_vu", "music_beat", "music_switch"};
+                            "music_pulse", "music_vu", "music_beat", "music_switch", "launch"};
 const char *EFFECT_NAMES[] = {"Regenbogen", "Farbwechsel", "Welle", "Atmen", "Funkeln", "Regen", "Verkabelungstest",
-                              "Puls", "Pegel", "Beat-Farben", "Bass-Wechsel"};
+                              "Puls", "Pegel", "Beat-Farben", "Bass-Wechsel", "Launchpad-Start"};
 const int NUM_EFFECTS = sizeof(EFFECT_IDS) / sizeof(EFFECT_IDS[0]);
 const int WIRING_TEST = 6;
 
@@ -444,6 +444,19 @@ void renderEffect() {
         i = (i + 1 + random(6)) % 8;   // nie zweimal dieselbe Farbe
       }
       fillFrame(COLORS[i]);
+      break;
+    }
+    case 11: {  // Launchpad-Start: bunte Welle läuft schräg über die Decke und verglüht, abwechselnd von beiden Ecken
+      const float SPEED = 8;                          // Kästen pro Sekunde
+      const float span = ROWS + COLS - 2 + 8;         // Weg der Welle plus Nachglühen
+      int n = (int)(t * SPEED / span);
+      float head = t * SPEED - n * span;
+      for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) {
+          float d = (n % 2) ? (ROWS - 1 - r) + (COLS - 1 - c) : r + c;
+          float age = (head - d) / SPEED;             // Sekunden, seit die Welle hier war
+          frame[r][c] = age < 0 ? BLACK : hue(d / (ROWS + COLS) + n * 0.17f, 255, 255 * expf(-age * 2.5f));
+        }
       break;
     }
     case WIRING_TEST: {  // Reihe für Reihe von oben nach unten, oberster Kasten rot

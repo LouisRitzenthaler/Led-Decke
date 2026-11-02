@@ -85,7 +85,7 @@
   <section>
     <div id="grid"></div>
     <p id="hint">Tippen oder wischen, um Kästen zu färben.</p>
-    <p style="opacity:.4;font-size:11px;margin:0">Version 10</p>
+    <p style="opacity:.4;font-size:11px;margin:0">Version 11</p>
   </section>
 
   <section>
@@ -187,7 +187,7 @@ const UUID = {
 const EFFECTS = [["rainbow", "Regenbogen"], ["colorfade", "Farbwechsel"], ["wave", "Welle"],
   ["breathe", "Atmen"], ["sparkle", "Funkeln"], ["rain", "Regen"], ["wiring_test", "Verkabelungstest"],
   ["music_pulse", "Puls"], ["music_vu", "Pegel"], ["music_beat", "Beat-Farben"],
-  ["music_switch", "Bass-Wechsel"]]
+  ["music_switch", "Bass-Wechsel"], ["launch", "Launchpad-Start"]]
   .map(([id, name]) => ({ id, name }));
 let ble = null, sceneNames = [], bleChain = Promise.resolve();
 const enc = new TextEncoder(), dec = new TextDecoder();

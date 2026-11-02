@@ -6,7 +6,7 @@ Belegung (Spalten 1-9 von links, Reihen a-i von oben, a = obere runde Tasten):
   - Spalte 8    = 9 Farben (a Rot ... i Weiß) für die ausgewählten Kästen
   - 9b / 9c     = An / Aus (ausgewählte Kästen, ohne Auswahl die ganze Decke)
   - 9d / 9e     = Helligkeit + / - (ausgewählte Kästen, ohne Auswahl die ganze Decke)
-  - 9f - 9i     = Effekte. Nochmal drücken = Effekt aus
+  - 9f - 9i     = Effekte (Regenbogen, Farbwechsel, Launchpad-Start, Funkeln). Nochmal drücken = Effekt aus
 
 Nach einer Farbe ist die Auswahl sofort weg, nach Helligkeit 2,5 s nach dem
 letzten Drücken (so kann man mehrmals drücken).
@@ -49,11 +49,11 @@ DESELECT_AFTER = 2.5                   # Auswahl endet so viele Sekunden nach He
 COLORS = [(255, 0, 0), (255, 90, 0), (255, 210, 0), (0, 255, 0), (0, 255, 200),
           (0, 0, 255), (140, 0, 255), (255, 0, 140), (255, 255, 255)]
 # Spalte 9, von f bis i: (Name im ESP32, Farbe der Taste)
-EFFECTS = [("rainbow", (255, 0, 255)), ("colorfade", (0, 255, 255)), ("wave", (0, 80, 255)),
+EFFECTS = [("rainbow", (255, 0, 255)), ("colorfade", (0, 255, 255)), ("launch", (255, 120, 0)),
            ("sparkle", (255, 255, 255))]
 # Reihenfolge der Effekte im ESP32 (für die Nummer im Zustand)
 ESP_EFFECTS = ["rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test",
-               "music_pulse", "music_vu", "music_beat", "music_switch"]
+               "music_pulse", "music_vu", "music_beat", "music_switch", "launch"]
 
 
 # ---------------------------------------------------------------------
