@@ -223,11 +223,25 @@ void inDone(usb_transfer_t *t) {
 void outFinished(usb_transfer_t *) { xSemaphoreGive(outDone); }
 
 // Launchpad gefunden: MIDI-Anschluss suchen und öffnen
+// Geräte, die kein Launchpad sind (z. B. ein USB-Hub dazwischen), merken und in Ruhe lassen
+uint8_t skipAddr[8];
+int skipCount = 0;
+bool skipped(uint8_t a) {
+  for (int i = 0; i < skipCount; i++)
+    if (skipAddr[i] == a) return true;
+  return false;
+}
+void notLaunchpad(uint8_t addr, usb_device_handle_t dev) {
+  if (dev) usb_host_device_close(usbClient, dev);
+  if (skipCount < 8 && !skipped(addr)) skipAddr[skipCount++] = addr;
+}
+
 void openLaunchpad(uint8_t addr) {
   Serial.printf("Öffne USB-Gerät %u\n", addr);
-  if (usb_host_device_open(usbClient, addr, &lpDev) != ESP_OK) { Serial.println("USB: Öffnen fehlgeschlagen"); lpDev = nullptr; return; }
+  usb_device_handle_t dev = nullptr;
+  if (usb_host_device_open(usbClient, addr, &dev) != ESP_OK) { Serial.println("USB: Öffnen fehlgeschlagen"); notLaunchpad(addr, nullptr); return; }
   const usb_config_desc_t *cfg;
-  if (usb_host_get_active_config_descriptor(lpDev, &cfg) != ESP_OK) { Serial.println("USB: keine Beschreibung"); return; }
+  if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK) { Serial.println("USB: keine Beschreibung"); notLaunchpad(addr, dev); return; }
   const uint8_t *p = (const uint8_t *)cfg, *end = p + cfg->wTotalLength;
   int iface = -1, alt = 0, epIn = 0, epOut = 0, mpsIn = 64, mpsOut = 64;
   bool inMidi = false;
@@ -243,11 +257,13 @@ void openLaunchpad(uint8_t addr) {
     p += p[0];
   }
   if (iface < 0 || !epIn || !epOut) {
-    Serial.println("USB-Gerät ist kein Launchpad (kein MIDI)");
+    Serial.println("USB-Gerät ist kein Launchpad (kein MIDI), ignoriere es");
+    notLaunchpad(addr, dev);
     return;
   }
-  esp_err_t e = usb_host_interface_claim(usbClient, lpDev, iface, alt);
-  if (e != ESP_OK) { Serial.printf("USB: MIDI-Anschluss belegt (%s)\n", esp_err_to_name(e)); return; }
+  esp_err_t e = usb_host_interface_claim(usbClient, dev, iface, alt);
+  if (e != ESP_OK) { Serial.printf("USB: MIDI-Anschluss belegt (%s)\n", esp_err_to_name(e)); notLaunchpad(addr, dev); return; }
+  lpDev = dev;
   usb_host_transfer_alloc(mpsIn, 0, &lpIn);
   lpIn->device_handle = lpDev;
   lpIn->bEndpointAddress = epIn;
@@ -280,23 +296,25 @@ void usbClientTask(void *) {
   int tries = 1;
   for (;;) {
     usb_host_client_handle_events(usbClient, pdMS_TO_TICKS(50));
-    if (!lpDev && !newDevAddr && millis() - portOn > 5000) {
+    uint8_t list[8];
+    int n = 0;
+    usb_host_device_addr_list_fill(8, list, &n);
+    if (!lpDev && !newDevAddr && n == 0 && millis() - portOn > 5000) {  // gar nichts erkannt
       Serial.printf("Launchpad antwortet nicht, neuer Versuch (%d)\n", ++tries);
       usb_host_lib_set_root_port_power(false);
       vTaskDelay(pdMS_TO_TICKS(1000));
       usb_host_lib_set_root_port_power(true);
       portOn = millis();
     }
-    if (!lpDev && !newDevAddr && millis() - lastLook > 2000) {  // schon eingestecktes Gerät?
+    if (!lpDev && !newDevAddr && millis() - lastLook > 2000) {  // eingestecktes Gerät noch nicht geöffnet?
       lastLook = millis();
-      uint8_t list[4];
-      int n = 0;
-      if (usb_host_device_addr_list_fill(4, list, &n) == ESP_OK && n > 0) newDevAddr = list[0];
+      for (int k = 0; k < n; k++)
+        if (!skipped(list[k])) { newDevAddr = list[k]; break; }
     }
     if (newDevAddr && !lpDev) {
       uint8_t a = newDevAddr;
       newDevAddr = 0;
-      openLaunchpad(a);
+      if (!skipped(a)) openLaunchpad(a);
     }
     if (lpGone) {  // Launchpad abgesteckt: sauber neu starten
       Serial.println("Launchpad abgesteckt, starte neu");
