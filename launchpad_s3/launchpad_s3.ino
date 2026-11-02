@@ -101,6 +101,18 @@ bool parseState(const uint8_t *d, size_t n) {
   return true;
 }
 
+// Bluetooth-Suche: hört sofort auf, sobald die Decke gefunden ist
+const NimBLEAdvertisedDevice *volatile foundDeck = nullptr;
+class DeckScan : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *d) override {
+    if (foundDeck) return;
+    if (d->isAdvertisingService(NimBLEUUID(BLE_SERVICE)) || d->getName() == BLE_NAME) {
+      foundDeck = d;
+      NimBLEDevice::getScan()->stop();
+    }
+  }
+};
+
 // Läuft für sich: sucht die Decke, verbindet, schickt Befehle, holt den Zustand.
 void deckTask(void *) {
   NimBLEUUID svcUuid(BLE_SERVICE);
@@ -110,12 +122,15 @@ void deckTask(void *) {
     scan->setActiveScan(true);
     scan->setInterval(200);   // nur 25 % der Zeit suchen, sonst kommt das WLAN nicht durch
     scan->setWindow(50);
-    NimBLEScanResults found = scan->getResults(4000, false);
-    const NimBLEAdvertisedDevice *dev = nullptr;
-    for (int i = 0; i < found.getCount(); i++) {
-      const NimBLEAdvertisedDevice *d = found.getDevice(i);
-      if (d->isAdvertisingService(svcUuid) || d->getName() == BLE_NAME) dev = d;
-    }
+    static DeckScan callbacks;
+    scan->setScanCallbacks(&callbacks);
+    foundDeck = nullptr;
+    scan->clearResults();
+    scan->start(4000, false, true);
+    uint32_t t0 = millis();
+    while (!foundDeck && scan->isScanning() && millis() - t0 < 4500) vTaskDelay(pdMS_TO_TICKS(20));
+    if (scan->isScanning()) scan->stop();
+    const NimBLEAdvertisedDevice *dev = foundDeck;
     if (!dev) {
       Serial.println("Decke nicht gefunden, suche weiter");
       vTaskDelay(pdMS_TO_TICKS(1000));
