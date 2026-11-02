@@ -13,7 +13,7 @@
 //
 // Arduino IDE, Menü Tools:
 //   Board: "ESP32S3 Dev Module"
-//   USB Mode: "USB-OTG (TinyUSB)"        USB CDC On Boot: "Disabled"
+//   USB Mode: "Hardware CDC and JTAG"    USB CDC On Boot: "Disabled"
 //   Flash Size: "16MB (128Mb)"           PSRAM: "OPI PSRAM"
 //   Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)"
 // Bibliothek: NimBLE-Arduino (wie bei der Decke)
@@ -173,6 +173,15 @@ void usbHostTask(void *) {
   }
 }
 
+// Neuere ESP32-Pakete (ab 3.3.11) brauchen diese Freigabe, sonst wird kein USB-Gerät geöffnet
+#if CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+bool enumFilter(const usb_device_desc_t *desc, uint8_t *configValue) {
+  Serial.printf("USB-Gerät gefunden: %04X:%04X\n", desc->idVendor, desc->idProduct);
+  *configValue = 1;
+  return true;
+}
+#endif
+
 void clientEvent(const usb_host_client_event_msg_t *msg, void *) {
   if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) newDevAddr = msg->new_dev.address;
   else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) lpGone = true;
@@ -197,9 +206,10 @@ void outFinished(usb_transfer_t *) { xSemaphoreGive(outDone); }
 
 // Launchpad gefunden: MIDI-Anschluss suchen und öffnen
 void openLaunchpad(uint8_t addr) {
-  if (usb_host_device_open(usbClient, addr, &lpDev) != ESP_OK) return;
+  Serial.printf("Öffne USB-Gerät %u\n", addr);
+  if (usb_host_device_open(usbClient, addr, &lpDev) != ESP_OK) { Serial.println("USB: Öffnen fehlgeschlagen"); lpDev = nullptr; return; }
   const usb_config_desc_t *cfg;
-  if (usb_host_get_active_config_descriptor(lpDev, &cfg) != ESP_OK) return;
+  if (usb_host_get_active_config_descriptor(lpDev, &cfg) != ESP_OK) { Serial.println("USB: keine Beschreibung"); return; }
   const uint8_t *p = (const uint8_t *)cfg, *end = p + cfg->wTotalLength;
   int iface = -1, alt = 0, epIn = 0, epOut = 0, mpsIn = 64, mpsOut = 64;
   bool inMidi = false;
@@ -218,7 +228,8 @@ void openLaunchpad(uint8_t addr) {
     Serial.println("USB-Gerät ist kein Launchpad (kein MIDI)");
     return;
   }
-  if (usb_host_interface_claim(usbClient, lpDev, iface, alt) != ESP_OK) return;
+  esp_err_t e = usb_host_interface_claim(usbClient, lpDev, iface, alt);
+  if (e != ESP_OK) { Serial.printf("USB: MIDI-Anschluss belegt (%s)\n", esp_err_to_name(e)); return; }
   usb_host_transfer_alloc(mpsIn, 0, &lpIn);
   lpIn->device_handle = lpDev;
   lpIn->bEndpointAddress = epIn;
@@ -239,9 +250,17 @@ void usbClientTask(void *) {
   cfg.max_num_event_msg = 5;
   cfg.async.client_event_callback = clientEvent;
   cfg.async.callback_arg = nullptr;
-  usb_host_client_register(&cfg, &usbClient);
+  esp_err_t e = usb_host_client_register(&cfg, &usbClient);
+  Serial.printf("USB-Client: %s\n", esp_err_to_name(e));
+  uint32_t lastLook = 0;
   for (;;) {
     usb_host_client_handle_events(usbClient, pdMS_TO_TICKS(50));
+    if (!lpDev && !newDevAddr && millis() - lastLook > 2000) {  // schon eingestecktes Gerät?
+      lastLook = millis();
+      uint8_t list[4];
+      int n = 0;
+      if (usb_host_device_addr_list_fill(4, list, &n) == ESP_OK && n > 0) newDevAddr = list[0];
+    }
     if (newDevAddr && !lpDev) {
       uint8_t a = newDevAddr;
       newDevAddr = 0;
@@ -308,7 +327,11 @@ void startUsb() {
   usb_host_config_t cfg = {};
   cfg.skip_phy_setup = false;
   cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
-  usb_host_install(&cfg);
+#if CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+  cfg.enum_filter_cb = enumFilter;
+#endif
+  esp_err_t e = usb_host_install(&cfg);
+  Serial.printf("USB-Host: %s\n", esp_err_to_name(e));
   xTaskCreatePinnedToCore(usbHostTask, "usbhost", 4096, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(usbClientTask, "usbclient", 4096, nullptr, 2, nullptr, 0);
 }
