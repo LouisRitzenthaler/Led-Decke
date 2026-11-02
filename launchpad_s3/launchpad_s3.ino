@@ -14,7 +14,7 @@
 // Arduino IDE, Menü Tools:
 //   Board: "ESP32S3 Dev Module"
 //   USB Mode: "Hardware CDC and JTAG"    USB CDC On Boot: "Disabled"
-//   Flash Size: "16MB (128Mb)"           PSRAM: "OPI PSRAM"
+//   Flash Size: "16MB (128Mb)"  Flash Mode: "QIO 80MHz"  PSRAM: "Disabled"
 //   Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)"
 // Bibliothek: NimBLE-Arduino (wie bei der Decke)
 
@@ -271,8 +271,22 @@ void usbClientTask(void *) {
   esp_err_t e = usb_host_client_register(&cfg, &usbClient);
   Serial.printf("USB-Client: %s\n", esp_err_to_name(e));
   uint32_t lastLook = 0;
+  // Das Launchpad braucht nach dem Einschalten ein paar Sekunden (Start-Animation), bevor es
+  // auf USB antwortet. Deshalb den Anschluss erst dann einschalten und, falls es nicht klappt,
+  // aus- und wieder einschalten, bis das Launchpad da ist.
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  usb_host_lib_set_root_port_power(true);
+  uint32_t portOn = millis();
+  int tries = 1;
   for (;;) {
     usb_host_client_handle_events(usbClient, pdMS_TO_TICKS(50));
+    if (!lpDev && !newDevAddr && millis() - portOn > 5000) {
+      Serial.printf("Launchpad antwortet nicht, neuer Versuch (%d)\n", ++tries);
+      usb_host_lib_set_root_port_power(false);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      usb_host_lib_set_root_port_power(true);
+      portOn = millis();
+    }
     if (!lpDev && !newDevAddr && millis() - lastLook > 2000) {  // schon eingestecktes Gerät?
       lastLook = millis();
       uint8_t list[4];
@@ -345,6 +359,7 @@ void startUsb() {
   usb_host_config_t cfg = {};
   cfg.skip_phy_setup = false;
   cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.root_port_unpowered = true;   // erst einschalten, wenn das Launchpad bereit ist
 #if CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
   cfg.enum_filter_cb = enumFilter;
 #endif
