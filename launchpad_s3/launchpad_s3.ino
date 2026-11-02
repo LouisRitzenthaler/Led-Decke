@@ -108,6 +108,8 @@ void deckTask(void *) {
     if (otaRunning) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     NimBLEScan *scan = NimBLEDevice::getScan();
     scan->setActiveScan(true);
+    scan->setInterval(200);   // nur 25 % der Zeit suchen, sonst kommt das WLAN nicht durch
+    scan->setWindow(50);
     NimBLEScanResults found = scan->getResults(4000, false);
     const NimBLEAdvertisedDevice *dev = nullptr;
     for (int i = 0; i < found.getCount(); i++) {
@@ -116,6 +118,7 @@ void deckTask(void *) {
     }
     if (!dev) {
       Serial.println("Decke nicht gefunden, suche weiter");
+      vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
     NimBLEClient *client = NimBLEDevice::createClient();
@@ -353,6 +356,11 @@ void startWifi() {
 
 void handleNetwork() {
   if (wifiOff) return;
+  static wl_status_t lastStatus = WL_IDLE_STATUS;
+  if (WiFi.status() != lastStatus) {
+    lastStatus = WiFi.status();
+    Serial.printf("WLAN-Status: %d (3 = verbunden, 1 = Hotspot nicht gefunden, 4/6 = Passwort/Verbindung falsch)\n", lastStatus);
+  }
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() > wifiUntil && !Update.isRunning()) {
       WiFi.disconnect(true);
