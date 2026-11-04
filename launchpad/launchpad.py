@@ -336,8 +336,8 @@ def main():
             lp = Launchpad()
             break
         except (RuntimeError, OSError, StopIteration) as e:
-            print(e, "– neuer Versuch in 5 s", flush=True)
-            time.sleep(5)
+            print(e, "– neuer Versuch", flush=True)
+            time.sleep(0.5)
 
     chef = BleChef() if BleakClient else Chef()
     selected = set()          # ausgewählte Kästen (blinken)
