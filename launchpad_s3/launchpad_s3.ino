@@ -22,7 +22,7 @@
 #include <ArduinoOTA.h>
 #include <Update.h>
 #include <NimBLEDevice.h>
-#include <USBHost.h>
+#include "usb/usb_host.h"
 
 // ======================= EINSTELLUNGEN =======================
 #define WIFI_SSID      ""   // hier dein WLAN eintragen
@@ -173,73 +173,170 @@ void deckTask(void *) {
 }
 
 // ---------------------------------------------------------------------
-//  Launchpad MK2 per USB (MIDI) – mit dem TinyUSB-Host des ESP32-Pakets
+//  Launchpad MK2 per USB (MIDI)
 // ---------------------------------------------------------------------
-QueueHandle_t padQueue;          // gedrückte Tasten (Index wie ledIndex)
-QueueHandle_t sysexQueue;        // fertige USB-MIDI-Pakete an das Launchpad
-volatile int lpIdx = -1;
-volatile bool lpReady = false, lpGone = false, usbSeen = false;
-volatile uint16_t usbVid = 0, usbPid = 0;
+usb_host_client_handle_t usbClient;
+usb_device_handle_t lpDev = nullptr;
+usb_transfer_t *lpIn = nullptr, *lpOut = nullptr;
+SemaphoreHandle_t outDone;
+QueueHandle_t padQueue;          // gedrückte Tasten (Index wie led_index)
+volatile uint8_t newDevAddr = 0;
+volatile bool lpGone = false, lpReady = false;
 
-struct UsbMsg { uint8_t len; uint8_t data[60]; };   // mehrere 4-Byte-Pakete
-
-extern "C" void arduino_usb_host_hid_device_mounted(uint8_t daddr) {  // irgendein USB-Gerät erkannt
-  tuh_vid_pid_get(daddr, (uint16_t *)&usbVid, (uint16_t *)&usbPid);
-  usbSeen = true;
+void usbHostTask(void *) {
+  for (;;) {
+    uint32_t flags;
+    usb_host_lib_handle_events(portMAX_DELAY, &flags);
+    if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) usb_host_device_free_all();
+  }
 }
-extern "C" void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *) {
-  lpIdx = idx;
-  lpReady = true;
-}
-extern "C" void tuh_midi_umount_cb(uint8_t) { lpGone = true; }
 
-extern "C" void tuh_midi_rx_cb(uint8_t idx, uint32_t) {
-  uint8_t buf[64];
-  uint32_t n;
-  while ((n = tuh_midi_packet_read_n(idx, buf, sizeof(buf))) > 0) {
-    for (uint32_t i = 0; i + 3 < n; i += 4) {
-      uint8_t cin = buf[i] & 0x0F;
+// Neuere ESP32-Pakete (ab 3.3.11) brauchen diese Freigabe, sonst wird kein USB-Gerät geöffnet
+#if CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+bool enumFilter(const usb_device_desc_t *desc, uint8_t *configValue) {
+  Serial.printf("USB-Gerät gefunden: %04X:%04X\n", desc->idVendor, desc->idProduct);
+  *configValue = 1;
+  return true;
+}
+#endif
+
+void clientEvent(const usb_host_client_event_msg_t *msg, void *) {
+  if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) newDevAddr = msg->new_dev.address;
+  else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) lpGone = true;
+}
+
+void inDone(usb_transfer_t *t) {
+  if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
+    for (int i = 0; i + 3 < t->actual_num_bytes; i += 4) {
+      const uint8_t *p = t->data_buffer + i;
+      uint8_t cin = p[0] & 0x0F;
       // Note an (Raster, rechte Spalte) oder Controller (obere runde Tasten)
-      if ((cin == 0x9 || cin == 0xB) && buf[i + 3] > 0) {
-        uint8_t key = buf[i + 2];
-        xQueueSend(padQueue, &key, 0);
+      if ((cin == 0x9 || cin == 0xB) && p[3] > 0) {
+        uint8_t idx = p[2];
+        xQueueSend(padQueue, &idx, 0);
       }
     }
   }
+  if (!lpGone && t->status != USB_TRANSFER_STATUS_NO_DEVICE) usb_host_transfer_submit(t);
 }
 
-// Läuft im USB-Task direkt nach jeder USB-Runde: hier (und nur hier) wird ans Launchpad geschrieben
-extern "C" void arduino_usb_host_hid_service(void) {
-  static UsbMsg m;
-  static int done = 0;
-  static bool have = false;
-  if (!lpReady || lpIdx < 0) return;
-  for (int round = 0; round < 4; round++) {
-    if (!have) {
-      if (xQueueReceive(sysexQueue, &m, 0) != pdTRUE) break;
-      have = true;
-      done = 0;
+void outFinished(usb_transfer_t *) { xSemaphoreGive(outDone); }
+
+// Launchpad gefunden: MIDI-Anschluss suchen und öffnen
+// Geräte, die kein Launchpad sind (z. B. ein USB-Hub dazwischen), merken und in Ruhe lassen
+uint8_t skipAddr[8];
+int skipCount = 0;
+bool skipped(uint8_t a) {
+  for (int i = 0; i < skipCount; i++)
+    if (skipAddr[i] == a) return true;
+  return false;
+}
+void notLaunchpad(uint8_t addr, usb_device_handle_t dev) {
+  if (dev) usb_host_device_close(usbClient, dev);
+  if (skipCount < 8 && !skipped(addr)) skipAddr[skipCount++] = addr;
+}
+
+void openLaunchpad(uint8_t addr) {
+  Serial.printf("Öffne USB-Gerät %u\n", addr);
+  usb_device_handle_t dev = nullptr;
+  if (usb_host_device_open(usbClient, addr, &dev) != ESP_OK) { Serial.println("USB: Öffnen fehlgeschlagen"); notLaunchpad(addr, nullptr); return; }
+  const usb_config_desc_t *cfg;
+  if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK) { Serial.println("USB: keine Beschreibung"); notLaunchpad(addr, dev); return; }
+  const uint8_t *p = (const uint8_t *)cfg, *end = p + cfg->wTotalLength;
+  int iface = -1, alt = 0, epIn = 0, epOut = 0, mpsIn = 64, mpsOut = 64;
+  bool inMidi = false;
+  while (p < end && p[0] > 0) {
+    if (p[1] == 0x04) {  // Interface: Audio (1), MIDI-Streaming (3)
+      inMidi = p[5] == 1 && p[6] == 3 && iface < 0;
+      if (inMidi) { iface = p[2]; alt = p[3]; }
+    } else if (p[1] == 0x05 && inMidi && (p[3] & 0x03) == 2) {  // Bulk-Endpunkt
+      int mps = p[4] | (p[5] << 8);
+      if (p[2] & 0x80) { epIn = p[2]; mpsIn = mps; }
+      else { epOut = p[2]; mpsOut = mps; }
     }
-    done += tuh_midi_packet_write_n(lpIdx, m.data + done, m.len - done);
-    tuh_midi_write_flush(lpIdx);
-    if (done < m.len) break;   // Puffer voll: beim nächsten Mal weiter
-    have = false;
+    p += p[0];
+  }
+  if (iface < 0 || !epIn || !epOut) {
+    Serial.println("USB-Gerät ist kein Launchpad (kein MIDI), ignoriere es");
+    notLaunchpad(addr, dev);
+    return;
+  }
+  esp_err_t e = usb_host_interface_claim(usbClient, dev, iface, alt);
+  if (e != ESP_OK) { Serial.printf("USB: MIDI-Anschluss belegt (%s)\n", esp_err_to_name(e)); notLaunchpad(addr, dev); return; }
+  lpDev = dev;
+  usb_host_transfer_alloc(mpsIn, 0, &lpIn);
+  lpIn->device_handle = lpDev;
+  lpIn->bEndpointAddress = epIn;
+  lpIn->callback = inDone;
+  lpIn->num_bytes = mpsIn;
+  usb_host_transfer_submit(lpIn);
+  usb_host_transfer_alloc(max(64, mpsOut), 0, &lpOut);
+  lpOut->device_handle = lpDev;
+  lpOut->bEndpointAddress = epOut;
+  lpOut->callback = outFinished;
+  lpReady = true;
+  Serial.println("Launchpad verbunden");
+}
+
+void usbClientTask(void *) {
+  usb_host_client_config_t cfg = {};
+  cfg.is_synchronous = false;
+  cfg.max_num_event_msg = 5;
+  cfg.async.client_event_callback = clientEvent;
+  cfg.async.callback_arg = nullptr;
+  esp_err_t e = usb_host_client_register(&cfg, &usbClient);
+  Serial.printf("USB-Client: %s\n", esp_err_to_name(e));
+  uint32_t lastLook = 0;
+  // Das Launchpad braucht nach dem Einschalten ein paar Sekunden (Start-Animation), bevor es
+  // auf USB antwortet. Deshalb den Anschluss erst dann einschalten und, falls es nicht klappt,
+  // aus- und wieder einschalten, bis das Launchpad da ist.
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  usb_host_lib_set_root_port_power(true);
+  uint32_t portOn = millis();
+  int tries = 1;
+  for (;;) {
+    usb_host_client_handle_events(usbClient, pdMS_TO_TICKS(50));
+    uint8_t list[8];
+    int n = 0;
+    usb_host_device_addr_list_fill(8, list, &n);
+    if (!lpDev && !newDevAddr && n == 0 && millis() - portOn > 15000) {  // gar nichts erkannt (mit Hub dauert es länger)
+      Serial.printf("Launchpad antwortet nicht, neuer Versuch (%d)\n", ++tries);
+      usb_host_lib_set_root_port_power(false);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      usb_host_lib_set_root_port_power(true);
+      portOn = millis();
+    }
+    if (!lpDev && !newDevAddr && millis() - lastLook > 2000) {  // eingestecktes Gerät noch nicht geöffnet?
+      lastLook = millis();
+      for (int k = 0; k < n; k++)
+        if (!skipped(list[k])) { newDevAddr = list[k]; break; }
+    }
+    if (newDevAddr && !lpDev) {
+      uint8_t a = newDevAddr;
+      newDevAddr = 0;
+      if (!skipped(a)) openLaunchpad(a);
+    }
+    if (lpGone) {  // Launchpad abgesteckt: sauber neu starten
+      Serial.println("Launchpad abgesteckt, starte neu");
+      delay(200);
+      ESP.restart();
+    }
   }
 }
 
-// MIDI-SysEx in USB-Pakete (je 4 Byte) verpacken und einreihen
+// MIDI-SysEx in USB-Pakete (je 4 Byte) verpacken und schicken
 void sendSysex(const uint8_t *d, int n) {
   if (!lpReady) return;
-  UsbMsg m;
+  if (xSemaphoreTake(outDone, pdMS_TO_TICKS(100)) != pdTRUE) return;
   int k = 0;
-  for (int i = 0; i < n && k + 4 <= (int)sizeof(m.data); i += 3) {
+  for (int i = 0; i < n; i += 3) {
     int left = n - i;
     uint8_t cin = left > 3 ? 0x4 : (left == 3 ? 0x7 : (left == 2 ? 0x6 : 0x5));
-    m.data[k++] = cin;
-    for (int j = 0; j < 3; j++) m.data[k++] = j < left ? d[i + j] : 0;
+    lpOut->data_buffer[k++] = cin;
+    for (int j = 0; j < 3; j++) lpOut->data_buffer[k++] = j < left ? d[i + j] : 0;
   }
-  m.len = k;
-  xQueueSend(sysexQueue, &m, pdMS_TO_TICKS(100));
+  lpOut->num_bytes = k;
+  if (usb_host_transfer_submit(lpOut) != ESP_OK) xSemaphoreGive(outDone);
 }
 
 void lpCommand(const uint8_t *data, int n) {  // F0 00 20 29 02 18 <data> F7
@@ -274,10 +371,20 @@ void showLeds(const RGB *leds, const bool *use) {
 }
 
 void startUsb() {
+  outDone = xSemaphoreCreateBinary();
+  xSemaphoreGive(outDone);
   padQueue = xQueueCreate(32, 1);
-  sysexQueue = xQueueCreate(24, sizeof(UsbMsg));
-  bool ok = USBHost.begin();
-  Serial.printf("USB-Host (TinyUSB): %s\n", ok ? "ok" : "FEHLER");
+  usb_host_config_t cfg = {};
+  cfg.skip_phy_setup = false;
+  cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.root_port_unpowered = true;   // erst einschalten, wenn das Launchpad bereit ist
+#if CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+  cfg.enum_filter_cb = enumFilter;
+#endif
+  esp_err_t e = usb_host_install(&cfg);
+  Serial.printf("USB-Host: %s\n", esp_err_to_name(e));
+  xTaskCreatePinnedToCore(usbHostTask, "usbhost", 4096, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(usbClientTask, "usbclient", 4096, nullptr, 2, nullptr, 0);
 }
 
 // ---------------------------------------------------------------------
@@ -572,18 +679,6 @@ void loop() {
   handleNetwork();
   uint32_t now = millis();
 
-  static bool usbTold = false;
-  if (usbSeen && !usbTold) {
-    usbTold = true;
-    Serial.printf("USB-Gerät erkannt: %04X:%04X%s\n", usbVid, usbPid, lpReady ? " (Launchpad)" : "");
-  }
-  static bool lpTold = false;
-  if (lpReady && !lpTold) { lpTold = true; Serial.println("Launchpad verbunden"); }
-  if (lpGone) {  // Launchpad abgesteckt: sauber neu starten
-    Serial.println("Launchpad abgesteckt, starte neu");
-    delay(200);
-    ESP.restart();
-  }
   if (lpReady && !layoutSent) {
     const uint8_t session[] = {0x22, 0x00};   // Session-Layout
     lpCommand(session, 2);
