@@ -22,7 +22,6 @@
 #include <ArduinoOTA.h>
 #include <Update.h>
 #include <NimBLEDevice.h>
-#include "usb/usb_host.h"
 
 // ======================= EINSTELLUNGEN =======================
 #define WIFI_SSID      ""   // hier dein WLAN eintragen
@@ -174,152 +173,322 @@ void deckTask(void *) {
 
 // ---------------------------------------------------------------------
 //  Launchpad MK2 per USB (MIDI)
+//  Eigene USB-Anmeldung, so wie sie ein PC macht: zuerst 64 Byte der
+//  Gerätebeschreibung anfragen, dann noch mal zurücksetzen, dann Adresse.
+//  Benutzt direkt den USB-Treiber (HCD) aus dem ESP32-Paket.
 // ---------------------------------------------------------------------
-usb_host_client_handle_t usbClient;
-usb_device_handle_t lpDev = nullptr;
-usb_transfer_t *lpIn = nullptr, *lpOut = nullptr;
-SemaphoreHandle_t outDone;
-QueueHandle_t padQueue;          // gedrückte Tasten (Index wie led_index)
-volatile uint8_t newDevAddr = 0;
-volatile bool lpGone = false, lpReady = false;
+#include <sys/queue.h>
+#include "esp_private/usb_phy.h"
+#include "usb/usb_types_ch9.h"
+#include "usb/usb_types_stack.h"
 
-void usbHostTask(void *) {
-  for (;;) {
-    uint32_t flags;
-    usb_host_lib_handle_events(portMAX_DELAY, &flags);
-    if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) usb_host_device_free_all();
+extern "C" {
+// --- Auszug aus esp-idf v5.5 components/usb/private_include/hcd.h + usb_private.h ---
+typedef enum { HCD_PORT_STATE_NOT_POWERED, HCD_PORT_STATE_DISCONNECTED, HCD_PORT_STATE_DISABLED, HCD_PORT_STATE_RESETTING,
+               HCD_PORT_STATE_SUSPENDED, HCD_PORT_STATE_RESUMING, HCD_PORT_STATE_ENABLED, HCD_PORT_STATE_RECOVERY } hcd_port_state_t;
+typedef enum { HCD_PIPE_STATE_ACTIVE, HCD_PIPE_STATE_HALTED } hcd_pipe_state_t;
+typedef enum { HCD_PORT_EVENT_NONE, HCD_PORT_EVENT_CONNECTION, HCD_PORT_EVENT_DISCONNECTION, HCD_PORT_EVENT_ERROR,
+               HCD_PORT_EVENT_OVERCURRENT } hcd_port_event_t;
+typedef enum { HCD_PIPE_EVENT_NONE, HCD_PIPE_EVENT_URB_DONE, HCD_PIPE_EVENT_ERROR_XFER, HCD_PIPE_EVENT_ERROR_URB_NOT_AVAIL,
+               HCD_PIPE_EVENT_ERROR_OVERFLOW, HCD_PIPE_EVENT_ERROR_STALL } hcd_pipe_event_t;
+typedef enum { HCD_PORT_CMD_POWER_ON, HCD_PORT_CMD_POWER_OFF, HCD_PORT_CMD_RESET, HCD_PORT_CMD_SUSPEND, HCD_PORT_CMD_RESUME,
+               HCD_PORT_CMD_DISABLE } hcd_port_cmd_t;
+typedef enum { HCD_PIPE_CMD_HALT, HCD_PIPE_CMD_FLUSH, HCD_PIPE_CMD_CLEAR } hcd_pipe_cmd_t;
+typedef void *hcd_port_handle_t;
+typedef void *hcd_pipe_handle_t;
+typedef bool (*hcd_port_callback_t)(hcd_port_handle_t, hcd_port_event_t, void *, bool);
+typedef bool (*hcd_pipe_callback_t)(hcd_pipe_handle_t, hcd_pipe_event_t, void *, bool);
+typedef struct { uint32_t nptx_fifo_lines, ptx_fifo_lines, rx_fifo_lines; } hcd_fifo_settings_t;
+typedef struct { int intr_flags; const hcd_fifo_settings_t *fifo_config; unsigned peripheral_map; } hcd_config_t;
+typedef struct { hcd_port_callback_t callback; void *callback_arg; void *context; unsigned peripheral_idx; } hcd_port_config_t;
+typedef struct { hcd_pipe_callback_t callback; void *callback_arg; void *context; const usb_ep_desc_t *ep_desc;
+                 usb_speed_t dev_speed; uint8_t dev_addr; } hcd_pipe_config_t;
+struct urb_s {
+  TAILQ_ENTRY(urb_s) tailq_entry;
+  void *hcd_ptr;
+  uint32_t hcd_var;
+  void *usb_host_client;
+  bool usb_host_inflight;
+  usb_transfer_t transfer;
+};
+typedef struct urb_s urb_t;
+esp_err_t hcd_install(const hcd_config_t *config);
+esp_err_t hcd_port_init(int port_number, const hcd_port_config_t *port_config, hcd_port_handle_t *port_hdl);
+esp_err_t hcd_port_command(hcd_port_handle_t port_hdl, hcd_port_cmd_t command);
+hcd_port_state_t hcd_port_get_state(hcd_port_handle_t port_hdl);
+esp_err_t hcd_port_get_speed(hcd_port_handle_t port_hdl, usb_speed_t *speed);
+hcd_port_event_t hcd_port_handle_event(hcd_port_handle_t port_hdl);
+esp_err_t hcd_port_recover(hcd_port_handle_t port_hdl);
+esp_err_t hcd_pipe_alloc(hcd_port_handle_t port_hdl, const hcd_pipe_config_t *pipe_config, hcd_pipe_handle_t *pipe_hdl);
+int hcd_pipe_get_mps(hcd_pipe_handle_t pipe_hdl);
+esp_err_t hcd_pipe_free(hcd_pipe_handle_t pipe_hdl);
+esp_err_t hcd_pipe_update_mps(hcd_pipe_handle_t pipe_hdl, int mps);
+esp_err_t hcd_pipe_update_dev_addr(hcd_pipe_handle_t pipe_hdl, uint8_t dev_addr);
+esp_err_t hcd_pipe_command(hcd_pipe_handle_t pipe_hdl, hcd_pipe_cmd_t command);
+esp_err_t hcd_urb_enqueue(hcd_pipe_handle_t pipe_hdl, urb_t *urb);
+urb_t *hcd_urb_dequeue(hcd_pipe_handle_t pipe_hdl);
+urb_t *urb_alloc(size_t data_buffer_size, int num_isoc_packets);
+void urb_free(urb_t *urb);
+}
+
+QueueHandle_t padQueue;          // gedrückte Tasten (Index wie led_index)
+QueueHandle_t sysexQueue;        // fertige USB-MIDI-Pakete ans Launchpad
+QueueHandle_t usbEvents;         // Meldungen vom USB-Treiber
+volatile bool lpReady = false, lpGone = false;
+struct UsbMsg { uint8_t len; uint8_t data[60]; };
+struct UsbEv { uint8_t kind; void *h; int ev; };   // kind 0 = Anschluss, 1 = Pipe
+
+hcd_port_handle_t usbPort = nullptr;
+hcd_pipe_handle_t ep0 = nullptr, pipeIn = nullptr, pipeOut = nullptr;
+urb_t *ctrlUrb = nullptr, *inUrb = nullptr, *outUrb = nullptr;
+usb_ep_desc_t epInDesc, epOutDesc;
+uint8_t cfgBuf[512];
+
+static bool portCb(hcd_port_handle_t h, hcd_port_event_t e, void *, bool isr) {
+  UsbEv x = {0, h, (int)e};
+  BaseType_t w = pdFALSE;
+  if (isr) xQueueSendFromISR(usbEvents, &x, &w); else xQueueSend(usbEvents, &x, 0);
+  return w == pdTRUE;
+}
+static bool pipeCb(hcd_pipe_handle_t h, hcd_pipe_event_t e, void *, bool isr) {
+  UsbEv x = {1, h, (int)e};
+  BaseType_t w = pdFALSE;
+  if (isr) xQueueSendFromISR(usbEvents, &x, &w); else xQueueSend(usbEvents, &x, 0);
+  return w == pdTRUE;
+}
+
+bool portLost = false;
+void portEvent() {
+  hcd_port_event_t pe = hcd_port_handle_event(usbPort);
+  if (pe == HCD_PORT_EVENT_DISCONNECTION || pe == HCD_PORT_EVENT_ERROR || pe == HCD_PORT_EVENT_OVERCURRENT) portLost = true;
+}
+
+// Auf eine Meldung für diese Pipe warten (Anschluss-Meldungen nebenbei erledigen)
+int waitPipe(hcd_pipe_handle_t p, uint32_t ms) {
+  uint32_t t0 = millis();
+  UsbEv e;
+  while (millis() - t0 < ms) {
+    if (xQueueReceive(usbEvents, &e, pdMS_TO_TICKS(10)) != pdTRUE) continue;
+    if (e.kind == 0) { portEvent(); if (portLost) return -1; }
+    else if (e.h == p) return e.ev;
+  }
+  return 0;  // keine Antwort
+}
+
+void pipeRecover(hcd_pipe_handle_t p) {
+  hcd_pipe_command(p, HCD_PIPE_CMD_HALT);
+  hcd_pipe_command(p, HCD_PIPE_CMD_FLUSH);
+  while (hcd_urb_dequeue(p)) {}
+  hcd_pipe_command(p, HCD_PIPE_CMD_CLEAR);
+}
+
+const char *evName(int ev) {
+  switch (ev) {
+    case -1: return "Gerät weg";
+    case 0: return "keine Antwort";
+    case HCD_PIPE_EVENT_ERROR_XFER: return "Übertragungsfehler";
+    case HCD_PIPE_EVENT_ERROR_OVERFLOW: return "zu viele Daten";
+    case HCD_PIPE_EVENT_ERROR_STALL: return "abgelehnt (STALL)";
+    default: return "Fehler";
   }
 }
 
-// Neuere ESP32-Pakete (ab 3.3.11) brauchen diese Freigabe, sonst wird kein USB-Gerät geöffnet
-#if CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
-bool enumFilter(const usb_device_desc_t *desc, uint8_t *configValue) {
-  Serial.printf("USB-Gerät gefunden: %04X:%04X\n", desc->idVendor, desc->idProduct);
-  *configValue = 1;
+// Steuer-Anfrage an Endpunkt 0. Gibt die Anzahl empfangener Daten-Bytes zurück, < 0 bei Fehler.
+int ctrl(uint8_t reqType, uint8_t req, uint16_t value, uint16_t index, uint16_t len, uint8_t **data) {
+  usb_setup_packet_t *s = (usb_setup_packet_t *)ctrlUrb->transfer.data_buffer;
+  s->bmRequestType = reqType;
+  s->bRequest = req;
+  s->wValue = value;
+  s->wIndex = index;
+  s->wLength = len;
+  int mps = hcd_pipe_get_mps(ep0);
+  ctrlUrb->transfer.num_bytes = sizeof(usb_setup_packet_t) + ((reqType & 0x80) ? ((len + mps - 1) / mps) * mps : len);
+  ctrlUrb->transfer.actual_num_bytes = 0;
+  if (hcd_urb_enqueue(ep0, ctrlUrb) != ESP_OK) { Serial.println("USB: Anfrage nicht möglich"); return -1; }
+  int ev = waitPipe(ep0, 1000);
+  if (ev != HCD_PIPE_EVENT_URB_DONE) {
+    Serial.printf("USB: Anfrage %02X/%02X: %s\n", reqType, req, evName(ev));
+    pipeRecover(ep0);
+    return -2;
+  }
+  urb_t *u = hcd_urb_dequeue(ep0);
+  if (!u || u->transfer.status != USB_TRANSFER_STATUS_COMPLETED) {
+    Serial.printf("USB: Anfrage %02X/%02X: Status %d\n", reqType, req, u ? (int)u->transfer.status : -9);
+    return -3;
+  }
+  if (data) *data = u->transfer.data_buffer + sizeof(usb_setup_packet_t);
+  return u->transfer.actual_num_bytes - sizeof(usb_setup_packet_t);
+}
+
+void freePipes() {
+  if (pipeIn) { pipeRecover(pipeIn); hcd_pipe_free(pipeIn); pipeIn = nullptr; }
+  if (pipeOut) { pipeRecover(pipeOut); hcd_pipe_free(pipeOut); pipeOut = nullptr; }
+  if (ep0) { hcd_pipe_free(ep0); ep0 = nullptr; }
+}
+
+bool resetPort() {
+  esp_err_t e = hcd_port_command(usbPort, HCD_PORT_CMD_RESET);
+  if (e != ESP_OK) { Serial.printf("USB: Zurücksetzen fehlgeschlagen (%s)\n", esp_err_to_name(e)); return false; }
+  vTaskDelay(pdMS_TO_TICKS(50));
   return true;
 }
-#endif
 
-void clientEvent(const usb_host_client_event_msg_t *msg, void *) {
-  if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) newDevAddr = msg->new_dev.address;
-  else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) lpGone = true;
-}
+// Anmeldung wie am PC
+bool enumerate() {
+  portLost = false;
+  vTaskDelay(pdMS_TO_TICKS(200));
+  if (!resetPort()) return false;
+  usb_speed_t sp = USB_SPEED_FULL;
+  hcd_port_get_speed(usbPort, &sp);
+  Serial.printf("USB: Gerät angeschlossen (%s Speed)\n", sp == USB_SPEED_LOW ? "Low" : sp == USB_SPEED_FULL ? "Full" : "High");
+  hcd_pipe_config_t pc = {pipeCb, nullptr, nullptr, nullptr, sp, 0};
+  if (hcd_pipe_alloc(usbPort, &pc, &ep0) != ESP_OK) { Serial.println("USB: Pipe fehlgeschlagen"); return false; }
 
-void inDone(usb_transfer_t *t) {
-  if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
-    for (int i = 0; i + 3 < t->actual_num_bytes; i += 4) {
-      const uint8_t *p = t->data_buffer + i;
-      uint8_t cin = p[0] & 0x0F;
-      // Note an (Raster, rechte Spalte) oder Controller (obere runde Tasten)
-      if ((cin == 0x9 || cin == 0xB) && p[3] > 0) {
-        uint8_t idx = p[2];
-        xQueueSend(padQueue, &idx, 0);
-      }
-    }
+  // 1. Gerätebeschreibung mit 64 Byte anfragen (wie Windows und Linux)
+  uint8_t *d = nullptr;
+  int n = -1;
+  for (int i = 0; i < 3 && n < 8; i++) {
+    n = ctrl(0x80, 0x06, 0x0100, 0, 64, &d);
+    Serial.printf("USB: Gerätebeschreibung (64 Byte angefragt): %d Byte erhalten\n", n);
+    if (n < 8) vTaskDelay(pdMS_TO_TICKS(100));
   }
-  if (!lpGone && t->status != USB_TRANSFER_STATUS_NO_DEVICE) usb_host_transfer_submit(t);
-}
+  if (n < 8) return false;
+  uint8_t mps0 = d[7];
+  if (mps0 != 8 && mps0 != 16 && mps0 != 32 && mps0 != 64) mps0 = 64;
 
-void outFinished(usb_transfer_t *) { xSemaphoreGive(outDone); }
+  // 2. Noch einmal zurücksetzen (macht der PC auch), dann Adresse vergeben
+  if (!resetPort()) return false;
+  if (ctrl(0x00, 0x05, 1, 0, 0, nullptr) < 0) return false;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  hcd_pipe_update_dev_addr(ep0, 1);
+  hcd_pipe_update_mps(ep0, mps0);
 
-// Launchpad gefunden: MIDI-Anschluss suchen und öffnen
-// Geräte, die kein Launchpad sind (z. B. ein USB-Hub dazwischen), merken und in Ruhe lassen
-uint8_t skipAddr[8];
-int skipCount = 0;
-bool skipped(uint8_t a) {
-  for (int i = 0; i < skipCount; i++)
-    if (skipAddr[i] == a) return true;
-  return false;
-}
-void notLaunchpad(uint8_t addr, usb_device_handle_t dev) {
-  if (dev) usb_host_device_close(usbClient, dev);
-  if (skipCount < 8 && !skipped(addr)) skipAddr[skipCount++] = addr;
-}
+  // 3. Ganze Gerätebeschreibung
+  n = ctrl(0x80, 0x06, 0x0100, 0, 18, &d);
+  if (n < 18) return false;
+  Serial.printf("USB-Gerät gefunden: %04X:%04X\n", d[8] | (d[9] << 8), d[10] | (d[11] << 8));
 
-void openLaunchpad(uint8_t addr) {
-  Serial.printf("Öffne USB-Gerät %u\n", addr);
-  usb_device_handle_t dev = nullptr;
-  if (usb_host_device_open(usbClient, addr, &dev) != ESP_OK) { Serial.println("USB: Öffnen fehlgeschlagen"); notLaunchpad(addr, nullptr); return; }
-  const usb_config_desc_t *cfg;
-  if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK) { Serial.println("USB: keine Beschreibung"); notLaunchpad(addr, dev); return; }
-  const uint8_t *p = (const uint8_t *)cfg, *end = p + cfg->wTotalLength;
-  int iface = -1, alt = 0, epIn = 0, epOut = 0, mpsIn = 64, mpsOut = 64;
-  bool inMidi = false;
+  // 4. Konfiguration lesen
+  n = ctrl(0x80, 0x06, 0x0200, 0, 9, &d);
+  if (n < 9) return false;
+  int total = d[2] | (d[3] << 8);
+  uint8_t cfgValue = d[5];
+  if (total > (int)sizeof(cfgBuf)) total = sizeof(cfgBuf);
+  n = ctrl(0x80, 0x06, 0x0200, 0, total, &d);
+  if (n < 9) return false;
+  memcpy(cfgBuf, d, n);
+
+  // MIDI-Anschluss suchen (Audio-Klasse 1, MIDI-Streaming 3, Bulk-Endpunkte)
+  const uint8_t *p = cfgBuf, *end = cfgBuf + n;
+  int iface = -1, alt = 0;
+  bool inMidi = false, haveIn = false, haveOut = false;
   while (p < end && p[0] > 0) {
-    if (p[1] == 0x04) {  // Interface: Audio (1), MIDI-Streaming (3)
+    if (p[1] == 0x04) {
       inMidi = p[5] == 1 && p[6] == 3 && iface < 0;
       if (inMidi) { iface = p[2]; alt = p[3]; }
-    } else if (p[1] == 0x05 && inMidi && (p[3] & 0x03) == 2) {  // Bulk-Endpunkt
-      int mps = p[4] | (p[5] << 8);
-      if (p[2] & 0x80) { epIn = p[2]; mpsIn = mps; }
-      else { epOut = p[2]; mpsOut = mps; }
+    } else if (p[1] == 0x05 && inMidi && (p[3] & 0x03) == 2) {
+      if (p[2] & 0x80) { memcpy(&epInDesc, p, 7); haveIn = true; }
+      else { memcpy(&epOutDesc, p, 7); haveOut = true; }
     }
     p += p[0];
   }
-  if (iface < 0 || !epIn || !epOut) {
-    Serial.println("USB-Gerät ist kein Launchpad (kein MIDI), ignoriere es");
-    notLaunchpad(addr, dev);
-    return;
+  if (iface < 0 || !haveIn || !haveOut) { Serial.println("USB-Gerät ist kein Launchpad (kein MIDI)"); return false; }
+
+  // 5. Konfiguration einschalten
+  if (ctrl(0x00, 0x09, cfgValue, 0, 0, nullptr) < 0) return false;
+  if (alt) ctrl(0x01, 0x0B, alt, iface, 0, nullptr);
+
+  // 6. MIDI-Pipes anlegen
+  hcd_pipe_config_t pin = {pipeCb, nullptr, nullptr, &epInDesc, sp, 1};
+  hcd_pipe_config_t pout = {pipeCb, nullptr, nullptr, &epOutDesc, sp, 1};
+  if (hcd_pipe_alloc(usbPort, &pin, &pipeIn) != ESP_OK || hcd_pipe_alloc(usbPort, &pout, &pipeOut) != ESP_OK) {
+    Serial.println("USB: MIDI-Pipes fehlgeschlagen");
+    return false;
   }
-  esp_err_t e = usb_host_interface_claim(usbClient, dev, iface, alt);
-  if (e != ESP_OK) { Serial.printf("USB: MIDI-Anschluss belegt (%s)\n", esp_err_to_name(e)); notLaunchpad(addr, dev); return; }
-  lpDev = dev;
-  usb_host_transfer_alloc(mpsIn, 0, &lpIn);
-  lpIn->device_handle = lpDev;
-  lpIn->bEndpointAddress = epIn;
-  lpIn->callback = inDone;
-  lpIn->num_bytes = mpsIn;
-  usb_host_transfer_submit(lpIn);
-  usb_host_transfer_alloc(max(64, mpsOut), 0, &lpOut);
-  lpOut->device_handle = lpDev;
-  lpOut->bEndpointAddress = epOut;
-  lpOut->callback = outFinished;
-  lpReady = true;
-  Serial.println("Launchpad verbunden");
+  int mpsIn = USB_EP_DESC_GET_MPS(&epInDesc);
+  if (!inUrb) inUrb = urb_alloc(64, 0);
+  if (!outUrb) outUrb = urb_alloc(64, 0);
+  inUrb->transfer.num_bytes = mpsIn > 64 ? 64 : mpsIn;
+  hcd_urb_enqueue(pipeIn, inUrb);
+  return true;
 }
 
-void usbClientTask(void *) {
-  usb_host_client_config_t cfg = {};
-  cfg.is_synchronous = false;
-  cfg.max_num_event_msg = 5;
-  cfg.async.client_event_callback = clientEvent;
-  cfg.async.callback_arg = nullptr;
-  esp_err_t e = usb_host_client_register(&cfg, &usbClient);
-  Serial.printf("USB-Client: %s\n", esp_err_to_name(e));
-  uint32_t lastLook = 0;
-  // Das Launchpad braucht nach dem Einschalten ein paar Sekunden (Start-Animation), bevor es
-  // auf USB antwortet. Deshalb den Anschluss erst dann einschalten und, falls es nicht klappt,
-  // aus- und wieder einschalten, bis das Launchpad da ist.
-  vTaskDelay(pdMS_TO_TICKS(3000));
-  usb_host_lib_set_root_port_power(true);
-  uint32_t portOn = millis();
-  int tries = 1;
+void handleIn(int ev) {
+  urb_t *u = hcd_urb_dequeue(pipeIn);
+  if (ev != HCD_PIPE_EVENT_URB_DONE) { pipeRecover(pipeIn); u = inUrb; }
+  else if (u && u->transfer.status == USB_TRANSFER_STATUS_COMPLETED) {
+    for (int i = 0; i + 3 < u->transfer.actual_num_bytes; i += 4) {
+      const uint8_t *b = u->transfer.data_buffer + i;
+      uint8_t cin = b[0] & 0x0F;
+      // Note an (Raster, rechte Spalte) oder Controller (obere runde Tasten)
+      if ((cin == 0x9 || cin == 0xB) && b[3] > 0) xQueueSend(padQueue, &b[2], 0);
+    }
+  }
+  inUrb->transfer.actual_num_bytes = 0;
+  hcd_urb_enqueue(pipeIn, inUrb);
+}
+
+void usbTask(void *) {
+  usb_phy_config_t phy = {};
+  phy.controller = USB_PHY_CTRL_OTG;
+  phy.target = USB_PHY_TARGET_INT;
+  phy.otg_mode = USB_OTG_MODE_HOST;
+  phy.otg_speed = USB_PHY_SPEED_UNDEFINED;
+  usb_phy_handle_t phyHandle;
+  esp_err_t e = usb_new_phy(&phy, &phyHandle);
+  hcd_config_t hc = {ESP_INTR_FLAG_LEVEL1, nullptr, 1};
+  if (e == ESP_OK) e = hcd_install(&hc);
+  hcd_port_config_t pc = {portCb, nullptr, nullptr, 0};
+  if (e == ESP_OK) e = hcd_port_init(0, &pc, &usbPort);
+  if (e == ESP_OK) e = hcd_port_command(usbPort, HCD_PORT_CMD_POWER_ON);
+  Serial.printf("USB-Host (eigene Anmeldung): %s\n", esp_err_to_name(e));
+  if (e != ESP_OK) vTaskDelete(nullptr);
+  ctrlUrb = urb_alloc(sizeof(usb_setup_packet_t) + sizeof(cfgBuf), 0);
+
+  int tries = 0;
   for (;;) {
-    usb_host_client_handle_events(usbClient, pdMS_TO_TICKS(50));
-    uint8_t list[8];
-    int n = 0;
-    usb_host_device_addr_list_fill(8, list, &n);
-    if (!lpDev && !newDevAddr && n == 0 && millis() - portOn > 15000) {  // gar nichts erkannt (mit Hub dauert es länger)
-      Serial.printf("Launchpad antwortet nicht, neuer Versuch (%d)\n", ++tries);
-      usb_host_lib_set_root_port_power(false);
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      usb_host_lib_set_root_port_power(true);
-      portOn = millis();
+    // Warten, bis ein Gerät steckt
+    while (hcd_port_get_state(usbPort) != HCD_PORT_STATE_DISABLED && hcd_port_get_state(usbPort) != HCD_PORT_STATE_ENABLED) {
+      UsbEv ev;
+      if (xQueueReceive(usbEvents, &ev, pdMS_TO_TICKS(100)) == pdTRUE && ev.kind == 0) portEvent();
+      if (hcd_port_get_state(usbPort) == HCD_PORT_STATE_RECOVERY) {
+        hcd_port_recover(usbPort);
+        hcd_port_command(usbPort, HCD_PORT_CMD_POWER_ON);
+      }
     }
-    if (!lpDev && !newDevAddr && millis() - lastLook > 2000) {  // eingestecktes Gerät noch nicht geöffnet?
-      lastLook = millis();
-      for (int k = 0; k < n; k++)
-        if (!skipped(list[k])) { newDevAddr = list[k]; break; }
+    if (enumerate()) break;
+    freePipes();
+    Serial.printf("Launchpad antwortet nicht, neuer Versuch (%d)\n", ++tries);
+    // Anschluss kurz ausschalten und wieder an
+    hcd_port_command(usbPort, HCD_PORT_CMD_POWER_OFF);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    UsbEv ev;
+    while (xQueueReceive(usbEvents, &ev, 0) == pdTRUE) if (ev.kind == 0) portEvent();
+    if (hcd_port_get_state(usbPort) == HCD_PORT_STATE_RECOVERY) hcd_port_recover(usbPort);
+    hcd_port_command(usbPort, HCD_PORT_CMD_POWER_ON);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  lpReady = true;
+  Serial.println("Launchpad verbunden");
+
+  bool outBusy = false;
+  for (;;) {
+    UsbEv ev;
+    if (xQueueReceive(usbEvents, &ev, pdMS_TO_TICKS(5)) == pdTRUE) {
+      if (ev.kind == 0) { portEvent(); if (portLost) lpGone = true; }
+      else if (ev.h == pipeIn) handleIn(ev.ev);
+      else if (ev.h == pipeOut) {
+        if (ev.ev != HCD_PIPE_EVENT_URB_DONE) pipeRecover(pipeOut);
+        else hcd_urb_dequeue(pipeOut);
+        outBusy = false;
+      }
     }
-    if (newDevAddr && !lpDev) {
-      uint8_t a = newDevAddr;
-      newDevAddr = 0;
-      if (!skipped(a)) openLaunchpad(a);
-    }
-    if (lpGone) {  // Launchpad abgesteckt: sauber neu starten
-      Serial.println("Launchpad abgesteckt, starte neu");
-      delay(200);
-      ESP.restart();
+    UsbMsg m;
+    if (!outBusy && !lpGone && xQueueReceive(sysexQueue, &m, 0) == pdTRUE) {
+      memcpy(outUrb->transfer.data_buffer, m.data, m.len);
+      outUrb->transfer.num_bytes = m.len;
+      outUrb->transfer.actual_num_bytes = 0;
+      outBusy = hcd_urb_enqueue(pipeOut, outUrb) == ESP_OK;
     }
   }
 }
@@ -327,16 +496,16 @@ void usbClientTask(void *) {
 // MIDI-SysEx in USB-Pakete (je 4 Byte) verpacken und schicken
 void sendSysex(const uint8_t *d, int n) {
   if (!lpReady) return;
-  if (xSemaphoreTake(outDone, pdMS_TO_TICKS(100)) != pdTRUE) return;
+  UsbMsg m;
   int k = 0;
-  for (int i = 0; i < n; i += 3) {
+  for (int i = 0; i < n && k + 4 <= (int)sizeof(m.data); i += 3) {
     int left = n - i;
     uint8_t cin = left > 3 ? 0x4 : (left == 3 ? 0x7 : (left == 2 ? 0x6 : 0x5));
-    lpOut->data_buffer[k++] = cin;
-    for (int j = 0; j < 3; j++) lpOut->data_buffer[k++] = j < left ? d[i + j] : 0;
+    m.data[k++] = cin;
+    for (int j = 0; j < 3; j++) m.data[k++] = j < left ? d[i + j] : 0;
   }
-  lpOut->num_bytes = k;
-  if (usb_host_transfer_submit(lpOut) != ESP_OK) xSemaphoreGive(outDone);
+  m.len = k;
+  xQueueSend(sysexQueue, &m, pdMS_TO_TICKS(100));
 }
 
 void lpCommand(const uint8_t *data, int n) {  // F0 00 20 29 02 18 <data> F7
@@ -371,22 +540,11 @@ void showLeds(const RGB *leds, const bool *use) {
 }
 
 void startUsb() {
-  outDone = xSemaphoreCreateBinary();
-  xSemaphoreGive(outDone);
   padQueue = xQueueCreate(32, 1);
-  usb_host_config_t cfg = {};
-  cfg.skip_phy_setup = false;
-  cfg.intr_flags = ESP_INTR_FLAG_LEVEL1;
-  cfg.root_port_unpowered = true;   // erst einschalten, wenn das Launchpad bereit ist
-#if CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
-  cfg.enum_filter_cb = enumFilter;
-#endif
-  esp_err_t e = usb_host_install(&cfg);
-  Serial.printf("USB-Host: %s\n", esp_err_to_name(e));
-  xTaskCreatePinnedToCore(usbHostTask, "usbhost", 4096, nullptr, 3, nullptr, 0);
-  xTaskCreatePinnedToCore(usbClientTask, "usbclient", 4096, nullptr, 2, nullptr, 0);
+  sysexQueue = xQueueCreate(24, sizeof(UsbMsg));
+  usbEvents = xQueueCreate(32, sizeof(UsbEv));
+  xTaskCreatePinnedToCore(usbTask, "usb", 6144, nullptr, 5, nullptr, 0);
 }
-
 // ---------------------------------------------------------------------
 //  WLAN: nach dem Einschalten 2 Minuten suchen, verbunden bleiben,
 //  bei Verlust 2 Minuten weitersuchen, sonst WLAN aus.
@@ -678,6 +836,11 @@ void loop() {
   static uint32_t started = millis();
   handleNetwork();
   uint32_t now = millis();
+  if (lpGone) {  // Launchpad abgesteckt: sauber neu starten
+    Serial.println("Launchpad abgesteckt, starte neu");
+    delay(200);
+    ESP.restart();
+  }
 
   if (lpReady && !layoutSent) {
     const uint8_t session[] = {0x22, 0x00};   // Session-Layout
