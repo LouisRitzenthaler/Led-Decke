@@ -23,6 +23,62 @@
 #include <Update.h>
 #include <NimBLEDevice.h>
 
+// --- USB-Treiber (HCD) des ESP32-Pakets, muss ganz oben stehen ---
+#include <sys/queue.h>
+#include "esp_private/usb_phy.h"
+#include "usb/usb_types_ch9.h"
+#include "usb/usb_types_stack.h"
+
+extern "C" {
+// --- Auszug aus esp-idf v5.5 components/usb/private_include/hcd.h + usb_private.h ---
+typedef enum { HCD_PORT_STATE_NOT_POWERED, HCD_PORT_STATE_DISCONNECTED, HCD_PORT_STATE_DISABLED, HCD_PORT_STATE_RESETTING,
+               HCD_PORT_STATE_SUSPENDED, HCD_PORT_STATE_RESUMING, HCD_PORT_STATE_ENABLED, HCD_PORT_STATE_RECOVERY } hcd_port_state_t;
+typedef enum { HCD_PIPE_STATE_ACTIVE, HCD_PIPE_STATE_HALTED } hcd_pipe_state_t;
+typedef enum { HCD_PORT_EVENT_NONE, HCD_PORT_EVENT_CONNECTION, HCD_PORT_EVENT_DISCONNECTION, HCD_PORT_EVENT_ERROR,
+               HCD_PORT_EVENT_OVERCURRENT } hcd_port_event_t;
+typedef enum { HCD_PIPE_EVENT_NONE, HCD_PIPE_EVENT_URB_DONE, HCD_PIPE_EVENT_ERROR_XFER, HCD_PIPE_EVENT_ERROR_URB_NOT_AVAIL,
+               HCD_PIPE_EVENT_ERROR_OVERFLOW, HCD_PIPE_EVENT_ERROR_STALL } hcd_pipe_event_t;
+typedef enum { HCD_PORT_CMD_POWER_ON, HCD_PORT_CMD_POWER_OFF, HCD_PORT_CMD_RESET, HCD_PORT_CMD_SUSPEND, HCD_PORT_CMD_RESUME,
+               HCD_PORT_CMD_DISABLE } hcd_port_cmd_t;
+typedef enum { HCD_PIPE_CMD_HALT, HCD_PIPE_CMD_FLUSH, HCD_PIPE_CMD_CLEAR } hcd_pipe_cmd_t;
+typedef void *hcd_port_handle_t;
+typedef void *hcd_pipe_handle_t;
+typedef bool (*hcd_port_callback_t)(hcd_port_handle_t, hcd_port_event_t, void *, bool);
+typedef bool (*hcd_pipe_callback_t)(hcd_pipe_handle_t, hcd_pipe_event_t, void *, bool);
+typedef struct { uint32_t nptx_fifo_lines, ptx_fifo_lines, rx_fifo_lines; } hcd_fifo_settings_t;
+typedef struct { int intr_flags; const hcd_fifo_settings_t *fifo_config; unsigned peripheral_map; } hcd_config_t;
+typedef struct { hcd_port_callback_t callback; void *callback_arg; void *context; unsigned peripheral_idx; } hcd_port_config_t;
+typedef struct { hcd_pipe_callback_t callback; void *callback_arg; void *context; const usb_ep_desc_t *ep_desc;
+                 usb_speed_t dev_speed; uint8_t dev_addr; } hcd_pipe_config_t;
+struct urb_s {
+  TAILQ_ENTRY(urb_s) tailq_entry;
+  void *hcd_ptr;
+  uint32_t hcd_var;
+  void *usb_host_client;
+  bool usb_host_inflight;
+  usb_transfer_t transfer;
+};
+typedef struct urb_s urb_t;
+esp_err_t hcd_install(const hcd_config_t *config);
+esp_err_t hcd_port_init(int port_number, const hcd_port_config_t *port_config, hcd_port_handle_t *port_hdl);
+esp_err_t hcd_port_command(hcd_port_handle_t port_hdl, hcd_port_cmd_t command);
+hcd_port_state_t hcd_port_get_state(hcd_port_handle_t port_hdl);
+esp_err_t hcd_port_get_speed(hcd_port_handle_t port_hdl, usb_speed_t *speed);
+hcd_port_event_t hcd_port_handle_event(hcd_port_handle_t port_hdl);
+esp_err_t hcd_port_recover(hcd_port_handle_t port_hdl);
+esp_err_t hcd_pipe_alloc(hcd_port_handle_t port_hdl, const hcd_pipe_config_t *pipe_config, hcd_pipe_handle_t *pipe_hdl);
+int hcd_pipe_get_mps(hcd_pipe_handle_t pipe_hdl);
+esp_err_t hcd_pipe_free(hcd_pipe_handle_t pipe_hdl);
+esp_err_t hcd_pipe_update_mps(hcd_pipe_handle_t pipe_hdl, int mps);
+esp_err_t hcd_pipe_update_dev_addr(hcd_pipe_handle_t pipe_hdl, uint8_t dev_addr);
+esp_err_t hcd_pipe_command(hcd_pipe_handle_t pipe_hdl, hcd_pipe_cmd_t command);
+esp_err_t hcd_urb_enqueue(hcd_pipe_handle_t pipe_hdl, urb_t *urb);
+urb_t *hcd_urb_dequeue(hcd_pipe_handle_t pipe_hdl);
+urb_t *urb_alloc(size_t data_buffer_size, int num_isoc_packets);
+void urb_free(urb_t *urb);
+}
+
+
 // ======================= EINSTELLUNGEN =======================
 #define WIFI_SSID      ""   // hier dein WLAN eintragen
 #define WIFI_PASSWORD  ""
@@ -177,60 +233,6 @@ void deckTask(void *) {
 //  Gerätebeschreibung anfragen, dann noch mal zurücksetzen, dann Adresse.
 //  Benutzt direkt den USB-Treiber (HCD) aus dem ESP32-Paket.
 // ---------------------------------------------------------------------
-#include <sys/queue.h>
-#include "esp_private/usb_phy.h"
-#include "usb/usb_types_ch9.h"
-#include "usb/usb_types_stack.h"
-
-extern "C" {
-// --- Auszug aus esp-idf v5.5 components/usb/private_include/hcd.h + usb_private.h ---
-typedef enum { HCD_PORT_STATE_NOT_POWERED, HCD_PORT_STATE_DISCONNECTED, HCD_PORT_STATE_DISABLED, HCD_PORT_STATE_RESETTING,
-               HCD_PORT_STATE_SUSPENDED, HCD_PORT_STATE_RESUMING, HCD_PORT_STATE_ENABLED, HCD_PORT_STATE_RECOVERY } hcd_port_state_t;
-typedef enum { HCD_PIPE_STATE_ACTIVE, HCD_PIPE_STATE_HALTED } hcd_pipe_state_t;
-typedef enum { HCD_PORT_EVENT_NONE, HCD_PORT_EVENT_CONNECTION, HCD_PORT_EVENT_DISCONNECTION, HCD_PORT_EVENT_ERROR,
-               HCD_PORT_EVENT_OVERCURRENT } hcd_port_event_t;
-typedef enum { HCD_PIPE_EVENT_NONE, HCD_PIPE_EVENT_URB_DONE, HCD_PIPE_EVENT_ERROR_XFER, HCD_PIPE_EVENT_ERROR_URB_NOT_AVAIL,
-               HCD_PIPE_EVENT_ERROR_OVERFLOW, HCD_PIPE_EVENT_ERROR_STALL } hcd_pipe_event_t;
-typedef enum { HCD_PORT_CMD_POWER_ON, HCD_PORT_CMD_POWER_OFF, HCD_PORT_CMD_RESET, HCD_PORT_CMD_SUSPEND, HCD_PORT_CMD_RESUME,
-               HCD_PORT_CMD_DISABLE } hcd_port_cmd_t;
-typedef enum { HCD_PIPE_CMD_HALT, HCD_PIPE_CMD_FLUSH, HCD_PIPE_CMD_CLEAR } hcd_pipe_cmd_t;
-typedef void *hcd_port_handle_t;
-typedef void *hcd_pipe_handle_t;
-typedef bool (*hcd_port_callback_t)(hcd_port_handle_t, hcd_port_event_t, void *, bool);
-typedef bool (*hcd_pipe_callback_t)(hcd_pipe_handle_t, hcd_pipe_event_t, void *, bool);
-typedef struct { uint32_t nptx_fifo_lines, ptx_fifo_lines, rx_fifo_lines; } hcd_fifo_settings_t;
-typedef struct { int intr_flags; const hcd_fifo_settings_t *fifo_config; unsigned peripheral_map; } hcd_config_t;
-typedef struct { hcd_port_callback_t callback; void *callback_arg; void *context; unsigned peripheral_idx; } hcd_port_config_t;
-typedef struct { hcd_pipe_callback_t callback; void *callback_arg; void *context; const usb_ep_desc_t *ep_desc;
-                 usb_speed_t dev_speed; uint8_t dev_addr; } hcd_pipe_config_t;
-struct urb_s {
-  TAILQ_ENTRY(urb_s) tailq_entry;
-  void *hcd_ptr;
-  uint32_t hcd_var;
-  void *usb_host_client;
-  bool usb_host_inflight;
-  usb_transfer_t transfer;
-};
-typedef struct urb_s urb_t;
-esp_err_t hcd_install(const hcd_config_t *config);
-esp_err_t hcd_port_init(int port_number, const hcd_port_config_t *port_config, hcd_port_handle_t *port_hdl);
-esp_err_t hcd_port_command(hcd_port_handle_t port_hdl, hcd_port_cmd_t command);
-hcd_port_state_t hcd_port_get_state(hcd_port_handle_t port_hdl);
-esp_err_t hcd_port_get_speed(hcd_port_handle_t port_hdl, usb_speed_t *speed);
-hcd_port_event_t hcd_port_handle_event(hcd_port_handle_t port_hdl);
-esp_err_t hcd_port_recover(hcd_port_handle_t port_hdl);
-esp_err_t hcd_pipe_alloc(hcd_port_handle_t port_hdl, const hcd_pipe_config_t *pipe_config, hcd_pipe_handle_t *pipe_hdl);
-int hcd_pipe_get_mps(hcd_pipe_handle_t pipe_hdl);
-esp_err_t hcd_pipe_free(hcd_pipe_handle_t pipe_hdl);
-esp_err_t hcd_pipe_update_mps(hcd_pipe_handle_t pipe_hdl, int mps);
-esp_err_t hcd_pipe_update_dev_addr(hcd_pipe_handle_t pipe_hdl, uint8_t dev_addr);
-esp_err_t hcd_pipe_command(hcd_pipe_handle_t pipe_hdl, hcd_pipe_cmd_t command);
-esp_err_t hcd_urb_enqueue(hcd_pipe_handle_t pipe_hdl, urb_t *urb);
-urb_t *hcd_urb_dequeue(hcd_pipe_handle_t pipe_hdl);
-urb_t *urb_alloc(size_t data_buffer_size, int num_isoc_packets);
-void urb_free(urb_t *urb);
-}
-
 QueueHandle_t padQueue;          // gedrückte Tasten (Index wie led_index)
 QueueHandle_t sysexQueue;        // fertige USB-MIDI-Pakete ans Launchpad
 QueueHandle_t usbEvents;         // Meldungen vom USB-Treiber
