@@ -455,24 +455,35 @@ def main():
             selected.clear()
             deselect_at = None
 
+    def on_press(i):
+        nonlocal deselect_at
+        if i in box_at:
+            if deselect_at:            # nach Helligkeit: neue Auswahl beginnt
+                selected.clear()
+                deselect_at = None
+            selected.symmetric_difference_update({box_at[i]})
+        elif i in color_at:
+            on_color(color_at[i])
+            deselect_at = None
+        elif i in func_at:
+            on_function(func_at[i])
+
+    early = []                # Tasten, die gedrückt wurden, bevor die Decke verbunden war
     last_warn = time.monotonic() - 25
     started = time.monotonic()
     last_check = 0
     while True:
         try:
+            if early and chef.synced():   # jetzt nachholen
+                for i in early:
+                    on_press(i)
+                early.clear()
             for i in lp.presses():
                 if not chef.synced():
+                    early.append(i)
+                    del early[:-50]
                     continue
-                if i in box_at:
-                    if deselect_at:            # nach Helligkeit: neue Auswahl beginnt
-                        selected.clear()
-                        deselect_at = None
-                    selected ^= {box_at[i]}
-                elif i in color_at:
-                    on_color(color_at[i])
-                    deselect_at = None
-                elif i in func_at:
-                    on_function(func_at[i])
+                on_press(i)
 
             now = time.monotonic()
             if deselect_at and now >= deselect_at:

@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Baut das LED-Decke Mini-System (initramfs) aus Kernel-Modulen und Firmware dieses Pi.
+
+Aufruf: sudo led-mini-build [Kernel-Version]
+Ergebnis: <Boot-Partition>/led-mini.img
+"""
+import glob
+import gzip
+import lzma
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+VER = sys.argv[1] if len(sys.argv) > 1 else os.uname().release
+BOOT = "/boot/firmware" if os.path.exists("/boot/firmware/config.txt") else "/boot"
+INIT = "/usr/local/lib/led-mini/init"
+MODPROBE = shutil.which("modprobe") or "/sbin/modprobe"
+
+WANT = ["snd-usb-audio", "snd-rawmidi", "snd-seq-midi", "hci_uart", "btbcm", "bluetooth",
+        "ecdh_generic", "vfat", "nls_cp437", "nls_iso8859_1", "nls_ascii", "nls_utf8", "ext4",
+        "crypto-cmac(aes)", "crypto-ecb(aes)", "crypto-aes", "crypto-ecdh", "crypto-ccm(aes)",
+        "crypto-sha256", "crypto-hmac(sha256)"]
+LOADED = re.compile(r"^(snd_usb|snd_rawmidi|snd_hwdep|snd_usbmidi|snd_pcm$|snd_timer|snd$|soundcore|"
+                    r"snd_seq|bt|hci|bluetooth|ecdh|ecc|cmac|ecb|ccm|aes|libaes|rfkill|crc)")
+
+
+def show_depends(name):
+    r = subprocess.run([MODPROBE, "-S", VER, "--show-depends", name], capture_output=True, text=True)
+    return [line.split()[1] for line in r.stdout.splitlines() if line.startswith("insmod ")]
+
+
+mods = []
+names = list(WANT)
+if VER == os.uname().release:
+    try:
+        with open("/proc/modules") as f:
+            names += [l.split()[0] for l in f if LOADED.match(l.split()[0])]
+    except OSError:
+        pass
+for n in names:
+    for p in show_depends(n):
+        if p not in mods:
+            mods.append(p)
+if not any("snd-usb-audio" in m or "snd_usb_audio" in m for m in mods):
+    print("WARNUNG: Modul snd-usb-audio nicht gefunden (vielleicht fest im Kernel)")
+if not any("hci_uart" in m for m in mods):
+    print("WARNUNG: Modul hci_uart nicht gefunden (vielleicht fest im Kernel)")
+
+
+def read_module(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if path.endswith(".xz"):
+        return lzma.decompress(data), path[:-3]
+    if path.endswith(".gz"):
+        return gzip.decompress(data), path[:-3]
+    if path.endswith(".zst"):
+        out = subprocess.run(["zstd", "-dc", path], capture_output=True, check=True).stdout
+        return out, path[:-4]
+    return data, path
+
+
+# --- cpio (newc) schreiben ---
+entries = []
+dirs = set()
+
+
+def add_dir(path):
+    parts = path.strip("/").split("/")
+    for i in range(1, len(parts) + 1):
+        d = "/".join(parts[:i])
+        if d and d not in dirs:
+            dirs.add(d)
+            entries.append((d, 0o040755, b"", 0, 0))
+
+
+def add_file(path, data, mode=0o100644):
+    add_dir(os.path.dirname(path.strip("/")))
+    entries.append((path.strip("/"), mode, data, 0, 0))
+
+
+for d in ["dev", "proc", "sys", "boot", "newroot", "lib/firmware/brcm"]:
+    add_dir(d)
+entries.append(("dev/console", 0o020600, b"", 5, 1))
+with open(INIT, "rb") as f:
+    add_file("init", f.read(), 0o100755)
+
+lines = []
+for m in mods:
+    data, name = read_module(m)
+    add_file(name, data)
+    lines.append(name)
+add_file("modules.txt", ("\n".join(lines) + "\n").encode())
+
+fw = sorted(set(glob.glob("/lib/firmware/**/BCM4343*.hcd", recursive=True)))
+if not fw:
+    print("WARNUNG: keine Bluetooth-Firmware (BCM43430A1.hcd) gefunden")
+for p in fw:
+    with open(p, "rb") as f:
+        data = f.read()
+    add_file(p, data)
+    alt = "/lib/firmware/brcm/" + os.path.basename(p)
+    if alt != p and alt not in fw:
+        add_file(alt, data)
+
+out = bytearray()
+
+
+def pad4():
+    while len(out) % 4:
+        out.append(0)
+
+
+for ino, (name, mode, data, rmaj, rmin) in enumerate(entries + [("TRAILER!!!", 0, b"", 0, 0)], 1):
+    nb = name.encode() + b"\0"
+    hdr = "070701" + "".join("%08X" % v for v in
+                             [ino, mode, 0, 0, 1, 0, len(data), 0, 0, rmaj, rmin, len(nb), 0])
+    out += hdr.encode() + nb
+    pad4()
+    out += data
+    pad4()
+
+img = gzip.compress(bytes(out), 6)
+tmp = os.path.join(BOOT, "led-mini.tmp")
+with open(tmp, "wb") as f:
+    f.write(img)
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, os.path.join(BOOT, "led-mini.img"))
+print("Mini-System gebaut: %s/led-mini.img (%d KB, Kernel %s, %d Module, %d Firmware-Dateien)"
+      % (BOOT, len(img) // 1024, VER, len(lines), len(fw)))
