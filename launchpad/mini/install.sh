@@ -20,11 +20,15 @@ esac
 
 echo "1/5 Programm laden ($BIN)"
 mkdir -p /usr/local/lib/led-mini
-curl -sSfL "$REPO/$BIN" -o /usr/local/lib/led-mini/init.neu
-chmod 755 /usr/local/lib/led-mini/init.neu
+if [ -n "$LED_MINI_SRC" ]; then   # ohne Internet: Dateien liegen schon auf der SD-Karte
+    cp "$LED_MINI_SRC/$BIN" /usr/local/lib/led-mini/init.neu
+    cp "$LED_MINI_SRC/led-mini-build" /usr/local/sbin/led-mini-build
+else
+    curl -sSfL "$REPO/$BIN" -o /usr/local/lib/led-mini/init.neu
+    curl -sSfL "$REPO/led-mini-build" -o /usr/local/sbin/led-mini-build
+fi
+chmod 755 /usr/local/lib/led-mini/init.neu /usr/local/sbin/led-mini-build
 mv /usr/local/lib/led-mini/init.neu /usr/local/lib/led-mini/init
-curl -sSfL "$REPO/led-mini-build" -o /usr/local/sbin/led-mini-build
-chmod 755 /usr/local/sbin/led-mini-build
 
 echo "2/5 Mini-System bauen"
 /usr/local/sbin/led-mini-build
@@ -53,9 +57,8 @@ camera_auto_detect=0
 display_auto_detect=0
 # <<< LED-Decke Mini-System
 EOF
-if grep -Eq '^[^#]*dtoverlay=(disable-bt|pi3-disable-bt)' "$CFG"; then
-    echo "WARNUNG: In $CFG ist Bluetooth abgeschaltet (disable-bt). Bitte die Zeile löschen."
-fi
+# Bluetooth darf nicht abgeschaltet sein
+sed -i -E 's/^([^#]*dtoverlay=(pi3-)?disable-bt.*)$/# \1/' "$CFG"
 
 echo "5/5 Mini-System aktivieren"
 rm -f "$BOOT/normal.txt" "$BOOT/NORMAL.TXT" "$BOOT/normal.txt.txt" "$BOOT/normal"
