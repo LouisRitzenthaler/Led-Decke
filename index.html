@@ -141,8 +141,10 @@ window.addEventListener("error", (e) => {
 // die ein Browser wie Bluefy selbst in die Seite einfügt.
 (() => {
 "use strict";
-const SWATCHES = ["#ffd9a0", "#ffffff", "#ff0000", "#ff6a00", "#ffd000", "#00ff40",
-                  "#00e0ff", "#0040ff", "#8000ff", "#ff00b0", "#ff4060", "#000000"];
+const SWATCHES = ["#ffd9a0", "#ffffff", "#c8dcff", "#ff0000", "#ff6a00", "#ffd000",
+                  "#00ff40", "#00e0ff", "#0040ff", "#8000ff", "#ff00b0", "#000000"];
+// Weißtöne: warm = nicht grell, Weiß = nur weiße LED, rein = ohne Gelbstich (etwas Blau dazu)
+const SW_LABEL = { "#ffd9a0": "warm", "#ffffff": "weiß", "#c8dcff": "rein" };
 const $ = (id) => document.getElementById(id);
 let S = null;          // letzter Zustand vom Pi
 let color = "#ff6a00";
@@ -387,6 +389,7 @@ SWATCHES.forEach((c) => {
   const b = document.createElement("button");
   b.className = "sw" + (c === "#000000" ? " off" : "");
   b.dataset.c = c; b.style.background = c;
+  if (SW_LABEL[c]) { b.textContent = SW_LABEL[c]; b.style.color = "#333"; b.style.fontSize = "11px"; }
   b.onclick = () => { setColor(c); if (S && S.mode !== "static") api("POST", "/api/settings", { color: c }).then(update); };
   $("swatches").appendChild(b);
 });
