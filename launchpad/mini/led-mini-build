@@ -18,7 +18,7 @@ BOOT = "/boot/firmware" if os.path.exists("/boot/firmware/config.txt") else "/bo
 INIT = "/usr/local/lib/led-mini/init"
 MODPROBE = shutil.which("modprobe") or "/sbin/modprobe"
 
-WANT = ["snd-usb-audio", "snd-rawmidi", "snd-seq-midi", "hci_uart", "btbcm", "bluetooth",
+WANT = ["usb-storage", "uas", "sd_mod", "snd-usb-audio", "snd-rawmidi", "snd-seq-midi", "hci_uart", "btbcm", "bluetooth",
         "ecdh_generic", "vfat", "nls_cp437", "nls_iso8859_1", "nls_ascii", "nls_utf8", "ext4",
         "crypto-cmac(aes)", "crypto-ecb(aes)", "crypto-aes", "crypto-ecdh", "crypto-ccm(aes)",
         "crypto-sha256", "crypto-hmac(sha256)"]

@@ -1116,17 +1116,25 @@ static void load_modules(void) {
     fclose(f);
 }
 
-/* normal.txt auf der Boot-Partition? Dann normales Raspberry Pi OS starten. */
+/* normal.txt auf der Boot-Partition? Dann normales Raspberry Pi OS starten.
+ * Das System kann auf der SD-Karte (mmcblk0) oder einem USB-Stick (sda) liegen. */
+static char root_dev[32];
+
 static int want_normal(void) {
+    static const char *boot[] = {"/dev/mmcblk0p1", "/dev/sda1"};
+    static const char *root[] = {"/dev/mmcblk0p2", "/dev/sda2"};
     mkdir("/boot", 0755);
-    for (int k = 0; k < 300; k++) { /* bis 3 s auf die SD-Karte warten */
-        if (access("/dev/mmcblk0p1", F_OK) == 0) break;
-        msleep(10);
+    int which = -1;
+    for (int k = 0; k < 500 && which < 0; k++) { /* bis 5 s warten (USB-Stick braucht länger) */
+        for (int j = 0; j < 2; j++)
+            if (access(boot[j], F_OK) == 0) { which = j; break; }
+        if (which < 0) msleep(10);
     }
-    if (mount("/dev/mmcblk0p1", "/boot", "vfat", MS_RDONLY, NULL) < 0) {
-        say("Boot-Partition nicht lesbar: %s", strerror(errno));
+    if (which < 0 || mount(boot[which], "/boot", "vfat", MS_RDONLY, NULL) < 0) {
+        say("Boot-Partition nicht lesbar");
         return 0;
     }
+    snprintf(root_dev, sizeof root_dev, "%s", root[which]);
     int normal = 0;
     DIR *d = opendir("/boot");
     if (d) {
@@ -1141,9 +1149,9 @@ static int want_normal(void) {
 }
 
 static void switch_to_normal(void) {
-    say("normal.txt gefunden: starte normales Raspberry Pi OS");
+    say("normal.txt gefunden: starte normales Raspberry Pi OS von %s", root_dev);
     mkdir("/newroot", 0755);
-    if (mount("/dev/mmcblk0p2", "/newroot", "ext4", MS_RDONLY, NULL) < 0) {
+    if (mount(root_dev, "/newroot", "ext4", MS_RDONLY, NULL) < 0) {
         say("Hauptsystem nicht mountbar: %s", strerror(errno));
         return;
     }
