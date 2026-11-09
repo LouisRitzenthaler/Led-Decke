@@ -113,6 +113,13 @@ uint8_t shownBrightness = 0;
 
 // Der ESP32 schickt die Streifen nacheinander raus. Nach jedem Streifen wird
 // der vorige Pin wieder fest auf LOW gelegt, damit seine Leitung nicht offen ist.
+// Gegen Flackern: Ein Streifen bekommt nur Daten, wenn sich seine Farben geändert
+// haben (dann zweimal hintereinander, damit ein gestörtes Bild sofort überschrieben
+// wird). Ein stehendes Bild wird danach gar nicht mehr neu gesendet.
+uint8_t lastSent[NUM_STRIPS][LEDS_PER_STRIP * 4];
+uint8_t resend[NUM_STRIPS];
+int lastPin = -1;
+
 void showAll() {
   for (int k = 0; k < NUM_STRIPS; k++) {
     Adafruit_NeoPixel *s = strips[k];
@@ -137,11 +144,20 @@ void showAll() {
                                 min(255, (int)(c.b * f + boost + 0.5f)), min(255, (int)(wOut + 0.5f)));
       for (int i = 0; i < boxCount[k][r]; i++) s->setPixelColor(boxFirst[k][r] + i, color);
     }
+    int n = s->numPixels() * 4;
+    if (memcmp(lastSent[k], s->getPixels(), n) != 0) {
+      memcpy(lastSent[k], s->getPixels(), n);
+      resend[k] = 2;
+    }
+    if (resend[k] == 0) continue;  // nichts geändert: Streifen in Ruhe lassen
+    resend[k]--;
     s->show();
     handleUdp();  // Launchpad zwischendurch bedienen, damit es nicht warten muss
-    int prev = (k + NUM_STRIPS - 1) % NUM_STRIPS;
-    pinMode(strips[prev]->getPin(), OUTPUT);
-    digitalWrite(strips[prev]->getPin(), LOW);
+    if (lastPin >= 0 && lastPin != s->getPin()) {
+      pinMode(lastPin, OUTPUT);
+      digitalWrite(lastPin, LOW);
+    }
+    lastPin = s->getPin();
   }
 }
 
