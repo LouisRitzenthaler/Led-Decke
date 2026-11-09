@@ -116,16 +116,25 @@ uint8_t shownBrightness = 0;
 void showAll() {
   for (int k = 0; k < NUM_STRIPS; k++) {
     Adafruit_NeoPixel *s = strips[k];
-    s->setBrightness(shownBrightness);
+    s->setBrightness(255);  // Helligkeit wird unten selbst gerechnet
+    // Helligkeit wie auf der Handy-Seite: 0..1 (1 = 100 %)
+    float level = (float)shownBrightness / MAX_BRIGHTNESS;
+    float cap = MAX_BRIGHTNESS / 255.0f;
     for (int r = 0; r < ROWS; r++) {
       CRGB c = frame[r][stripCol[k]];
       uint8_t w = 0;
+      float wOut = 0, boost = 0;
 #if USE_WHITE_CHANNEL
-      // Der gemeinsame Weiß-Anteil geht auf die weiße LED (heller, schöneres Weiß)
+      // Weiß-Anteil: bis 50 % Helligkeit nur die weiße LED (bei 50 % voll an),
+      // über 50 % kommen Rot, Grün und Blau dazu (bei 100 % alle vier voll).
       w = min(c.r, min(c.g, c.b));
       c.r -= w; c.g -= w; c.b -= w;
+      wOut = w * cap * min(1.0f, 2 * level);
+      boost = w * cap * max(0.0f, 2 * level - 1);
 #endif
-      uint32_t color = s->Color(c.r, c.g, c.b, w);
+      float f = cap * level;  // Farbanteil wie bisher
+      uint32_t color = s->Color(min(255, (int)(c.r * f + boost + 0.5f)), min(255, (int)(c.g * f + boost + 0.5f)),
+                                min(255, (int)(c.b * f + boost + 0.5f)), min(255, (int)(wOut + 0.5f)));
       for (int i = 0; i < boxCount[k][r]; i++) s->setPixelColor(boxFirst[k][r] + i, color);
     }
     s->show();
