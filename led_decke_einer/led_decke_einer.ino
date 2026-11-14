@@ -232,7 +232,9 @@ struct Lock {
 };
 
 CRGB boxes[ROWS][COLS];
-int mode = -1;                 // -1 = eigenes Muster, sonst Index in EFFECT_IDS
+int mode = -1;                 // -1 = eigenes Muster, -2 = Spiel vom Launchpad, sonst Index in EFFECT_IDS
+CRGB gameFrame[ROWS][COLS];    // Bild, das das Launchpad (Spiele) schickt
+unsigned long gameFrameAt = 0; // wann zuletzt ein Spielbild kam
 int brightness = MAX_BRIGHTNESS / 2;
 float speed = 1.0;
 CRGB fxColor(0xff, 0x6a, 0x00);
@@ -604,12 +606,29 @@ void buildState(uint8_t *buf) {
   memcpy(buf + 10 + ROWS * COLS * 3, frame, ROWS * COLS * 3);
 }
 
-// Befehle als JSON: {"op":"boxes"|"fill"|"settings"|"scene_save"|"scene_load"|"scene_delete"|"get", ...}
+// Spielbild vom Launchpad: {"op":"frame","px":"rrggbb..."} (63 Kästen, Reihe für Reihe)
+const char *cmdFrame(JsonDocument &doc) {
+  const char *px = doc["px"] | "";
+  if (strlen(px) != ROWS * COLS * 6) return "px";
+  Lock l;
+  for (int i = 0; i < ROWS * COLS; i++) {
+    char h[7];
+    memcpy(h, px + i * 6, 6);
+    h[6] = 0;
+    gameFrame[i / COLS][i % COLS] = CRGB((uint32_t)strtoul(h, nullptr, 16));
+  }
+  mode = -2;
+  gameFrameAt = millis();
+  return nullptr;  // nicht speichern (kein Flash-Schreiben bei Spielen)
+}
+
+// Befehle als JSON: {"op":"boxes"|"fill"|"settings"|"frame"|"scene_save"|"scene_load"|"scene_delete"|"get", ...}
 void runCommand(JsonDocument &doc) {
   String op = doc["op"] | "";
   if (op == "boxes") cmdBoxes(doc);
   else if (op == "fill") cmdFill(doc);
   else if (op == "settings") cmdSettings(doc);
+  else if (op == "frame") cmdFrame(doc);
   else if (op == "scene_save") cmdScene('s', doc["name"] | "");
   else if (op == "scene_load") cmdScene('l', doc["name"] | "");
   else if (op == "scene_delete") cmdScene('d', doc["name"] | "");
@@ -657,7 +676,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   }
 };
 
+bool blePaused = false;  // während eines WLAN-Updates bleibt Bluetooth aus
 void bluetoothPause(bool pause) {
+  blePaused = pause;
   NimBLEServer *srv = NimBLEDevice::getServer();
   if (!srv) return;
   srv->advertiseOnDisconnect(!pause);
@@ -739,7 +760,16 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long lastFrame = 0;
+  static unsigned long lastFrame = 0, lastAdvCheck = 0;
+  // Sicherheitsnetz: Solange noch ein Platz frei ist, muss die Decke per Bluetooth
+  // sichtbar sein. Sonst findet das Launchpad sie nach einem Abbruch nicht wieder.
+  if (millis() - lastAdvCheck > 3000) {
+    lastAdvCheck = millis();
+    NimBLEServer *srv = NimBLEDevice::getServer();
+    if (srv && !blePaused && srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS &&
+        !NimBLEDevice::getAdvertising()->isAdvertising())
+      NimBLEDevice::startAdvertising();
+  }
   handleNetwork();
   handleUdp();
   unsigned long now = millis();
@@ -747,7 +777,9 @@ void loop() {
     {
       Lock l;
       t += (now - lastFrame) / 1000.0f * speed;
-      if (mode < 0) memcpy(frame, boxes, sizeof(frame));
+      if (mode == -2 && now - gameFrameAt > 5000) mode = -1;  // Spiel vorbei/Launchpad weg
+      if (mode == -2) memcpy(frame, gameFrame, sizeof(frame));
+      else if (mode < 0) memcpy(frame, boxes, sizeof(frame));
       else renderEffect();
       shownBrightness = brightness;
       if (dirty && now - lastSave > 3000) {

@@ -50,10 +50,20 @@ static const char *UUID_STATE = "6e1d0003-8a3c-4c5b-9b1e-1ed0c0dec0de";
 #define POLL_S 0.1
 #define DESELECT_AFTER 2.5
 
-static const uint8_t COLORS[9][3] = {
-    {255, 0, 0}, {255, 90, 0}, {255, 210, 0}, {0, 255, 0}, {0, 255, 200},
-    {0, 0, 255}, {140, 0, 255}, {255, 0, 140}, {255, 255, 255}};
+#define N_COLORS 5 /* Spalte 8, a-e: Rot, Grün, Blau, Warmweiß, Reinweiß */
+static const uint8_t COLORS[N_COLORS][3] = {
+    {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 217, 160}, {200, 220, 255}};
 #define N_EFFECTS 4
+/* Funktionstasten (Spalte 9 und Effekte in Spalte 8) */
+#define F_ON 0
+#define F_OFF 1
+#define F_BRI_UP 2
+#define F_BRI_DOWN 3
+/* 4..7 = Effekte */
+#define F_TEMPO_UP 8
+#define F_TEMPO_DOWN 9
+#define F_ALL 10
+#define F_GAME 11
 static const char *EFFECT_NAME[N_EFFECTS] = {"rainbow", "colorfade", "launch", "sparkle"};
 static const uint8_t EFFECT_COLOR[N_EFFECTS][3] = {
     {255, 0, 255}, {0, 255, 255}, {255, 120, 0}, {255, 255, 255}};
@@ -103,7 +113,7 @@ static void uuid_le(const char *s, uint8_t out[16]) {
 /*  Gemeinsamer Zustand (Bluetooth-Thread <-> Launchpad)              */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    int mode, brightness, max;
+    int mode, brightness, max, speed10;
     uint8_t boxes[ROWS][COLS][3];
     uint8_t frame[ROWS][COLS][3];
 } State;
@@ -139,6 +149,29 @@ static int pop(char *out) {
     return ok;
 }
 
+/* Spielbild für die Decke: nur das neueste zählt, ältere werden überschrieben */
+static char g_frame_cmd[CMDLEN];
+static int g_frame_pending;
+
+static void post_frame(const char *cmd) {
+    pthread_mutex_lock(&mu);
+    snprintf(g_frame_cmd, CMDLEN, "%s", cmd);
+    g_frame_pending = 1;
+    pthread_mutex_unlock(&mu);
+}
+
+static int pop_frame(char *out) {
+    int ok = 0;
+    pthread_mutex_lock(&mu);
+    if (g_frame_pending) {
+        memcpy(out, g_frame_cmd, CMDLEN);
+        g_frame_pending = 0;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&mu);
+    return ok;
+}
+
 static void q_clear(void) {
     pthread_mutex_lock(&mu);
     q_head = q_tail;
@@ -147,7 +180,8 @@ static void q_clear(void) {
 
 static int synced(void) {
     pthread_mutex_lock(&mu);
-    int s = g_have_state && now() - g_last_ok < 3;
+    /* kurze Funk-Aussetzer (bis 10 s) nicht anzeigen, Tasten werden danach nachgeholt */
+    int s = g_have_state && now() - g_last_ok < 10;
     pthread_mutex_unlock(&mu);
     return s;
 }
@@ -157,6 +191,7 @@ static int parse_state(const uint8_t *d, int len, State *st) {
     st->mode = (int8_t)d[1];
     st->brightness = d[2];
     st->max = d[3] ? d[3] : 1;
+    st->speed10 = d[4];
     for (int r = 0; r < ROWS; r++)
         for (int c = 0; c < COLS; c++)
             for (int k = 0; k < 3; k++) {
@@ -518,8 +553,25 @@ static int read_state(void) {
     return 0;
 }
 
+/* Wo steht die Bluetooth-Verbindung? Das Launchpad zeigt es beim Warten als Farbe:
+ * 0 rot = Bluetooth startet, 1 blau = suche die Decke, 2 lila = Decke gefunden, verbinde,
+ * 3 gelb = verbunden, lese den Zustand */
+static volatile int g_stage;
+
+/* Bluetooth-Chip aus- und wieder einschalten (wenn sich nichts mehr verbinden lässt) */
+static void bt_restart(void) {
+    say("Bluetooth wird neu gestartet");
+    uint8_t off = 0, type = 0x06;
+    g_stage = 0;
+    mgmt_cmd(MGMT_OP_STOP_DISCOVERY, 0, &type, 1, 1000, NULL, NULL, NULL);
+    mgmt_cmd(MGMT_OP_SET_POWERED, 0, &off, 1, 10000, NULL, NULL, NULL);
+    msleep(500);
+    while (bt_power_on() < 0) msleep(500);
+}
+
 static void *ble_thread(void *arg) {
     (void)arg;
+    int fails = 0;
     uuid_le(UUID_SERVICE, svc_le);
     while ((mgmt_fd = mgmt_open()) < 0) {
         msleep(100);
@@ -527,25 +579,39 @@ static void *ble_thread(void *arg) {
     while (bt_power_on() < 0) msleep(500);
     char pending[CMDLEN];
     for (;;) {
+        if (fails >= 3) { /* dreimal hintereinander nichts: Bluetooth frisch starten */
+            bt_restart();
+            fails = 0;
+        }
+        g_stage = 1;
         if (bt_find_deck(10000) < 0) {
             say("Decke per Bluetooth nicht gefunden, suche weiter");
+            fails++;
             continue;
         }
+        g_stage = 2;
         say("Decke gefunden: %02X:%02X:%02X:%02X:%02X:%02X", found_addr[5], found_addr[4],
             found_addr[3], found_addr[2], found_addr[1], found_addr[0]);
-        att_fd = l2_connect(15000);
+        att_fd = l2_connect(8000);
+        if (att_fd < 0) fails++;
         if (att_fd >= 0) {
+            g_stage = 3;
             fcntl(att_fd, F_SETFL, 0);
             att_mtu = 23;
             if (att_setup() == 0) {
                 say("Decke per Bluetooth verbunden");
-                q_clear(); /* Tasten von vor der Verbindung macht das Hauptprogramm selbst */
+                pthread_mutex_lock(&mu);
+                int stale = now() - g_last_ok > 10;
+                pthread_mutex_unlock(&mu);
+                if (stale) q_clear(); /* lange weg: alte Befehle verwerfen (Tasten holt das Hauptprogramm nach) */
                 int have = 0;
                 double last_read = 0;
                 if (read_state() == 0) {
+                    fails = 0;
                     last_read = now();
                     for (;;) {
                         if (!have) have = pop(pending);
+                        if (!have) have = pop_frame(pending);
                         if (have) {
                             if (att_write(h_cmd, (uint8_t *)pending, strlen(pending)) < 0) break;
                             have = 0;
@@ -564,10 +630,7 @@ static void *ble_thread(void *arg) {
             close(att_fd);
             att_fd = -1;
         }
-        pthread_mutex_lock(&mu);
-        g_last_ok = 0;
-        pthread_mutex_unlock(&mu);
-        msleep(1000);
+        msleep(200); /* gleich neu verbinden; das Launchpad zeigt bis 10 s weiter den letzten Stand */
     }
     return NULL;
 }
@@ -764,6 +827,19 @@ static void scale_col(const uint8_t base[3], double level, uint8_t out[3]) {
 static int ch_used[ROWS][COLS];
 static uint8_t ch_col[ROWS][COLS][3];
 
+/* Was wir gerade geschickt haben, gilt 2 s lang lokal, auch wenn die Decke den neuen
+ * Stand noch nicht zurückgemeldet hat. So zählt jeder schnelle Tastendruck. */
+#define LOCAL_HOLD 2.0
+static uint8_t lb[ROWS][COLS][3];
+static double lb_until[ROWS][COLS];
+static int l_bri, l_speed10, l_mode;
+static double l_bri_until, l_speed_until, l_mode_until;
+
+static void set_local_mode(int m) {
+    l_mode = m;
+    l_mode_until = now() + LOCAL_HOLD;
+}
+
 static void ch_reset(void) { memset(ch_used, 0, sizeof ch_used); }
 static void ch_set(int r, int c, const uint8_t col[3]) {
     ch_used[r][c] = 1;
@@ -778,6 +854,13 @@ static void ch_apply(void) {
             if (!ch_used[r0][c0] || done[r0][c0]) continue;
             uint8_t col[3];
             memcpy(col, ch_col[r0][c0], 3);
+            for (int r = 0; r < ROWS; r++)
+                for (int c = 0; c < COLS; c++)
+                    if (ch_used[r][c] && !memcmp(ch_col[r][c], col, 3)) {
+                        memcpy(lb[r][c], col, 3);
+                        lb_until[r][c] = now() + LOCAL_HOLD;
+                    }
+            set_local_mode(-1);
             int cells[ROWS * COLS][2], n = 0;
             for (int r = 0; r < ROWS; r++)
                 for (int c = 0; c < COLS; c++)
@@ -870,7 +953,10 @@ static void on_off(int on) {
         return;
     }
     if (any) { /* Decke leuchtet schon: nur Effekt aus */
-        if (cur.mode >= 0) post("{\"op\":\"settings\",\"mode\":\"static\"}");
+        if (cur.mode >= 0) {
+            post("{\"op\":\"settings\",\"mode\":\"static\"}");
+            set_local_mode(-1);
+        }
         return;
     }
     for (int r = 0; r < ROWS; r++)
@@ -895,6 +981,8 @@ static void on_function(int f) {
             int bri = cur.brightness + step * BRIGHTNESS_STEP;
             if (bri > cur.max) bri = cur.max;
             if (bri < 0) bri = 0;
+            l_bri = bri;
+            l_bri_until = now() + LOCAL_HOLD;
             char cmd[CMDLEN];
             snprintf(cmd, sizeof cmd, "{\"op\":\"settings\",\"brightness\":%d}", bri);
             post(cmd);
@@ -920,19 +1008,367 @@ static void on_function(int f) {
             }
         ch_apply();
         deselect_at = now() + DESELECT_AFTER;
-    } else { /* Effekt: an, oder aus wenn er schon läuft */
+    } else if (f == F_TEMPO_UP || f == F_TEMPO_DOWN) { /* Tempo der Effekte */
+        int sp = cur.speed10 ? cur.speed10 : 10;
+        sp = f == F_TEMPO_UP ? (int)lround(sp * 1.25 + 0.5) : (int)lround(sp / 1.25);
+        if (sp > 50) sp = 50;
+        if (sp < 1) sp = 1;
+        l_speed10 = sp;
+        l_speed_until = now() + LOCAL_HOLD;
+        char cmd[CMDLEN];
+        snprintf(cmd, sizeof cmd, "{\"op\":\"settings\",\"speed\":%.1f}", sp / 10.0);
+        post(cmd);
+    } else if (f == F_ALL) { /* alle auswählen, nochmal = alle abwählen */
+        int all = n_sel == ROWS * COLS;
+        for (int r = 0; r < ROWS; r++)
+            for (int c = 0; c < COLS; c++) sel[r][c] = !all;
+        n_sel = all ? 0 : ROWS * COLS;
+        deselect_at = 0;
+    } else if (f >= 4 && f < 4 + N_EFFECTS) { /* Effekt: an, oder aus wenn er schon läuft */
         const char *name = EFFECT_NAME[f - 4];
         int running = cur.mode >= 0 && cur.mode < N_ESP_EFFECTS && !strcmp(ESP_EFFECTS[cur.mode], name);
         char cmd[CMDLEN];
         snprintf(cmd, sizeof cmd, "{\"op\":\"settings\",\"mode\":\"%s\"}", running ? "static" : name);
         post(cmd);
+        int m = -1;
+        for (int k = 0; k < N_ESP_EFFECTS && !running; k++)
+            if (!strcmp(ESP_EFFECTS[k], name)) m = k;
+        set_local_mode(m);
         sel_clear();
         deselect_at = 0;
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Spiele (laufen hier, Bild geht an Launchpad und Decke)             */
+/*  Spielfeld wie auf dem Launchpad gesehen: gy 0..8 oben->unten,      */
+/*  gx 0..6 links->rechts                                              */
+/* ------------------------------------------------------------------ */
+#define GH ROWS
+#define GW COLS
+static int game = -1;              /* -1 kein Spiel, 0 Tetris, 1 Ball-Spiel */
+#define N_GAMES 2
+static uint8_t gpix[GH][GW][3];    /* aktuelles Spielbild */
+static double game_over_until;      /* rotes Blinken nach "verloren" */
+static unsigned rng_state = 12345;
+
+static int rnd(int n) {
+    rng_state = rng_state * 1103515245u + 12345u;
+    return (int)((rng_state >> 16) % (unsigned)n);
+}
+
+static void gset(int y, int x, int r, int g, int b) {
+    if (y < 0 || y >= GH || x < 0 || x >= GW) return;
+    gpix[y][x][0] = r; gpix[y][x][1] = g; gpix[y][x][2] = b;
+}
+
+/* ---------- Tetris ---------- */
+static uint8_t tb[GH][GW];          /* 0 leer, sonst Farbnummer 1..7 */
+static int tp, trot, tx, ty;        /* Teil, Drehung, Position (4x4-Box) */
+static double t_next_fall;
+static int t_lines;
+static const uint16_t TSHAPE[7] = {0x0F00, 0x0660, 0x0E40, 0x06C0, 0x0C60, 0x08E0, 0x02E0}; /* I O T S Z J L */
+static const uint8_t TCOL[8][3] = {{0, 0, 0}, {0, 255, 255}, {255, 210, 0}, {160, 0, 255},
+                                    {0, 255, 0}, {255, 0, 0}, {0, 60, 255}, {255, 110, 0}};
+
+static int t_cell(int p, int rot, int cx, int cy) { /* ist (cx,cy) in der 4x4-Box belegt? */
+    int x = cx, y = cy;
+    for (int k = 0; k < (rot & 3); k++) { /* rückwärts drehen */
+        int nx = y, ny = 3 - x;
+        x = nx; y = ny;
+    }
+    if (p == 1) return (TSHAPE[p] >> (15 - (cy * 4 + cx))) & 1; /* O dreht nicht */
+    return (TSHAPE[p] >> (15 - (y * 4 + x))) & 1;
+}
+
+static int t_fits(int p, int rot, int px, int py) {
+    for (int cy = 0; cy < 4; cy++)
+        for (int cx = 0; cx < 4; cx++) {
+            if (!t_cell(p, rot, cx, cy)) continue;
+            int x = px + cx, y = py + cy;
+            if (x < 0 || x >= GW || y >= GH) return 0;
+            if (y >= 0 && tb[y][x]) return 0;
+        }
+    return 1;
+}
+
+static void t_spawn(void) {
+    tp = rnd(7);
+    trot = 0;
+    tx = 1;
+    ty = tp == 0 ? -1 : 0;
+    if (!t_fits(tp, trot, tx, ty)) { /* kein Platz mehr: verloren */
+        game_over_until = now() + 1.5;
+    }
+}
+
+static void t_reset(void) {
+    memset(tb, 0, sizeof tb);
+    t_lines = 0;
+    t_spawn();
+    t_next_fall = now() + 0.8;
+}
+
+static void t_lock(void) {
+    for (int cy = 0; cy < 4; cy++)
+        for (int cx = 0; cx < 4; cx++)
+            if (t_cell(tp, trot, cx, cy) && ty + cy >= 0) tb[ty + cy][tx + cx] = tp + 1;
+    for (int y = GH - 1; y >= 0; y--) { /* volle Reihen entfernen */
+        int full = 1;
+        for (int x = 0; x < GW; x++)
+            if (!tb[y][x]) full = 0;
+        if (full) {
+            memmove(tb[1], tb[0], sizeof(tb[0]) * y);
+            memset(tb[0], 0, sizeof tb[0]);
+            t_lines++;
+            y++;
+        }
+    }
+    t_spawn();
+}
+
+static double t_interval(void) { return fmax(0.15, 0.8 - t_lines * 0.04); }
+
+static void t_key(int k) { /* 0 drehen, 1 links, 2 rechts, 3 runter, 4 fallen lassen */
+    if (k == 0) {
+        int nr = (trot + 1) & 3;
+        if (t_fits(tp, nr, tx, ty)) trot = nr;
+        else if (t_fits(tp, nr, tx - 1, ty)) { trot = nr; tx--; }
+        else if (t_fits(tp, nr, tx + 1, ty)) { trot = nr; tx++; }
+    } else if (k == 1 && t_fits(tp, trot, tx - 1, ty)) tx--;
+    else if (k == 2 && t_fits(tp, trot, tx + 1, ty)) tx++;
+    else if (k == 3) {
+        if (t_fits(tp, trot, tx, ty + 1)) ty++;
+        else t_lock();
+        t_next_fall = now() + t_interval();
+    } else if (k == 4) {
+        while (t_fits(tp, trot, tx, ty + 1)) ty++;
+        t_lock();
+        t_next_fall = now() + t_interval();
+    }
+}
+
+static void t_tick(double t) {
+    if (t >= t_next_fall) {
+        if (t_fits(tp, trot, tx, ty + 1)) ty++;
+        else t_lock();
+        t_next_fall = t + t_interval();
+    }
+    for (int y = 0; y < GH; y++)
+        for (int x = 0; x < GW; x++) {
+            const uint8_t *c = TCOL[tb[y][x]];
+            gset(y, x, c[0], c[1], c[2]);
+        }
+    for (int cy = 0; cy < 4; cy++)
+        for (int cx = 0; cx < 4; cx++)
+            if (t_cell(tp, trot, cx, cy)) {
+                const uint8_t *c = TCOL[tp + 1];
+                gset(ty + cy, tx + cx, c[0], c[1], c[2]);
+            }
+}
+
+/* ---------- Ball-Spiel: Blöcke rücken von oben nach, Bälle prallen ab ---------- */
+#define MAX_BALLS 40
+static int bhp[GH][GW];             /* Trefferpunkte der Blöcke (Reihe 8 bleibt frei) */
+static int b_turn, b_hpmax;
+static double b_lx;                 /* Abschussstelle (x, unten) */
+static double b_first_x;
+static int b_first_set;
+static int b_flying;                /* Bälle unterwegs? */
+static int b_n, b_launched;
+static double b_next_launch, b_dirx, b_diry, b_last;
+static double bx[MAX_BALLS], by[MAX_BALLS], bvx[MAX_BALLS], bvy[MAX_BALLS];
+static int b_alive[MAX_BALLS];
+#define BALL_SPEED 9.0
+#define LAUNCH_Y (GH - 0.5)
+
+static void b_new_row(void) {
+    for (int y = GH - 2; y > 0; y--) memcpy(bhp[y], bhp[y - 1], sizeof bhp[0]);
+    memset(bhp[0], 0, sizeof bhp[0]);
+    int n = 2 + rnd(3) + (b_turn > 10 ? 1 : 0);
+    for (int k = 0; k < n; k++) {
+        int x = rnd(GW);
+        bhp[0][x] = b_turn + (rnd(4) == 0 ? b_turn : 0);
+        if (bhp[0][x] > b_hpmax) b_hpmax = bhp[0][x];
+    }
+}
+
+static int b_lost(void) {
+    for (int x = 0; x < GW; x++)
+        if (bhp[GH - 2][x]) return 1;
+    return 0;
+}
+
+static void b_reset(void) {
+    memset(bhp, 0, sizeof bhp);
+    b_turn = 1;
+    b_hpmax = 1;
+    b_lx = GW / 2.0;
+    b_flying = 0;
+    b_new_row();
+    b_turn++;
+    b_new_row();
+}
+
+static void b_aim(int gy, int gx) {
+    if (b_flying) return;
+    double dx = gx + 0.5 - b_lx, dy = gy + 0.5 - LAUNCH_Y;
+    if (dy > -0.6) return; /* muss nach oben gehen */
+    double len = sqrt(dx * dx + dy * dy);
+    b_dirx = dx / len;
+    b_diry = dy / len;
+    b_n = b_turn < MAX_BALLS ? b_turn : MAX_BALLS;
+    b_launched = 0;
+    b_first_set = 0;
+    b_flying = 1;
+    b_next_launch = now();
+    b_last = now();
+    memset(b_alive, 0, sizeof b_alive);
+}
+
+static void b_step(double dt) {
+    for (int k = 0; k < b_launched; k++) {
+        if (!b_alive[k]) continue;
+        double ox = bx[k], oy = by[k];
+        double nx = ox + bvx[k] * dt, ny = oy + bvy[k] * dt;
+        if (nx < 0.05) { nx = 0.05; bvx[k] = fabs(bvx[k]); }
+        if (nx > GW - 0.05) { nx = GW - 0.05; bvx[k] = -fabs(bvx[k]); }
+        if (ny < 0.05) { ny = 0.05; bvy[k] = fabs(bvy[k]); }
+        if (ny >= LAUNCH_Y && bvy[k] > 0) { /* wieder unten angekommen */
+            b_alive[k] = 0;
+            if (!b_first_set) { b_first_set = 1; b_first_x = nx; }
+            continue;
+        }
+        int cx = (int)nx, cy = (int)ny;
+        if (cy >= 0 && cy < GH - 1 && cx >= 0 && cx < GW && bhp[cy][cx] > 0) {
+            int ocx = (int)ox, ocy = (int)oy;
+            if (ocx != cx) bvx[k] = -bvx[k];
+            if (ocy != cy) bvy[k] = -bvy[k];
+            if (ocx == cx && ocy == cy) bvy[k] = -bvy[k];
+            bhp[cy][cx]--;
+            nx = ox;
+            ny = oy;
+        }
+        bx[k] = nx;
+        by[k] = ny;
+    }
+}
+
+static void b_tick(double t) {
+    if (b_flying) {
+        while (b_launched < b_n && t >= b_next_launch) {
+            int k = b_launched++;
+            bx[k] = b_lx; by[k] = LAUNCH_Y - 0.01;
+            bvx[k] = b_dirx * BALL_SPEED; bvy[k] = b_diry * BALL_SPEED;
+            b_alive[k] = 1;
+            b_next_launch += 0.12;
+        }
+        double dt = t - b_last;
+        if (dt > 0.1) dt = 0.1;
+        b_last = t;
+        for (int s = 0; s < 10; s++) b_step(dt / 10);
+        int any = b_launched < b_n;
+        for (int k = 0; k < b_launched; k++)
+            if (b_alive[k]) any = 1;
+        if (!any) { /* alle zurück: nächste Runde, alles rückt nach unten */
+            b_flying = 0;
+            if (b_first_set) b_lx = fmin(GW - 0.5, fmax(0.5, b_first_x));
+            b_turn++;
+            if (b_lost()) game_over_until = t + 1.5; /* Blöcke würden unten ankommen */
+            else b_new_row();
+        }
+    }
+    memset(gpix, 0, sizeof gpix);
+    for (int y = 0; y < GH - 1; y++)
+        for (int x = 0; x < GW; x++) {
+            int hp = bhp[y][x];
+            if (!hp) continue;
+            double f = fmin(1.0, (double)hp / (b_turn > 1 ? b_turn : 1)); /* grün (wenig) -> rot (viel) */
+            gset(y, x, (int)(255 * f), (int)(255 * (1 - f)), 0);
+        }
+    if (!b_flying) gset(GH - 1, (int)b_lx, 255, 255, 255); /* Abschussstelle */
+    for (int k = 0; k < b_launched; k++)
+        if (b_alive[k]) gset((int)by[k], (int)bx[k], 255, 255, 255);
+}
+
+/* ---------- gemeinsam ---------- */
+static void game_start(int g) {
+    game = g;
+    rng_state = (unsigned)(now() * 1000);
+    game_over_until = 0;
+    if (g == 0) t_reset();
+    else b_reset();
+    sel_clear();
+    deselect_at = 0;
+}
+
+static void game_stop(void) {
+    game = -1;
+    post("{\"op\":\"settings\",\"mode\":\"static\"}");
+    set_local_mode(-1);
+}
+
+static void game_tick(double t) {
+    if (game_over_until) {
+        if (t < game_over_until) {
+            int on = ((long)(t * 4)) % 2 == 0;
+            for (int y = 0; y < GH; y++)
+                for (int x = 0; x < GW; x++) gset(y, x, on ? 255 : 0, 0, 0);
+            return;
+        }
+        game_start(game); /* nochmal von vorn */
+    }
+    if (game == 0) t_tick(t);
+    else b_tick(t);
+}
+
+/* Spielbild an die Decke (höchstens ~12 Bilder pro Sekunde, nur bei Änderung) */
+static double last_frame_sent;
+static char last_frame_hex[ROWS * COLS * 6 + 1];
+
+static void game_send(double t) {
+    if (t - last_frame_sent < 0.08) return;
+    char hex[ROWS * COLS * 6 + 1];
+    int m = 0;
+    for (int r = 0; r < ROWS; r++)       /* Decke: Reihe r, Spalte c; Launchpad ist gespiegelt */
+        for (int c = 0; c < COLS; c++) {
+            const uint8_t *p = gpix[r][COLS - 1 - c];
+            m += sprintf(hex + m, "%02x%02x%02x", p[0], p[1], p[2]);
+        }
+    if (!strcmp(hex, last_frame_hex) && t - last_frame_sent < 2) return;
+    memcpy(last_frame_hex, hex, sizeof hex);
+    last_frame_sent = t;
+    char cmd[CMDLEN];
+    snprintf(cmd, sizeof cmd, "{\"op\":\"frame\",\"px\":\"%s\"}", hex);
+    post_frame(cmd);
+}
+
+/* Taste im Spiel. Rückgabe 1 = vom Spiel verbraucht */
+static int game_press(int i) {
+    if (game < 0) return 0;
+    if (game_over_until) return is_box[i] || color_of[i] >= 0;
+    if (game == 0 && color_of[i] >= 0) {
+        t_key(color_of[i]);
+        return 1;
+    }
+    if (game == 1 && is_box[i]) {
+        b_aim(box_r[i], COLS - 1 - box_c[i]);
+        return 1;
+    }
+    return is_box[i] || color_of[i] >= 0; /* Kästen/Farben machen im Spiel sonst nichts */
+}
+
 static void on_press(int i) {
     if (i < 0 || i >= 128) return;
+    if (func_of[i] == F_GAME) { /* Spiel an, nochmal = nächstes Spiel */
+        game_start(game < 0 ? 0 : (game + 1) % N_GAMES);
+        return;
+    }
+    if (game >= 0 && func_of[i] == F_OFF) { /* Aus beendet das Spiel */
+        game_stop();
+        return;
+    }
+    if (game_press(i)) return;
     if (is_box[i]) {
         if (deselect_at) { /* nach Helligkeit: neue Auswahl beginnt */
             sel_clear();
@@ -945,6 +1381,8 @@ static void on_press(int i) {
         on_color(color_of[i]);
         deselect_at = 0;
     } else if (func_of[i] >= 0) {
+        if (game >= 0 && (func_of[i] == F_ON || func_of[i] == F_ALL || (func_of[i] >= 4 && func_of[i] < 4 + N_EFFECTS)))
+            return; /* im Spiel ohne Wirkung */
         on_function(func_of[i]);
     }
 }
@@ -985,6 +1423,8 @@ static void app_main(void) {
         lp_sysex(d, 2);
     }
 
+    /* Belegung: Spalten 1-7 Kästen, Spalte 8 a-e Farben, f-i Effekte,
+     * Spalte 9 b Hell+, c Hell-, d Tempo+, e Tempo-, f An, g Aus, h Alle, i Spiele */
     for (int i = 0; i < 128; i++) {
         color_of[i] = -1;
         func_of[i] = -1;
@@ -997,13 +1437,11 @@ static void app_main(void) {
             box_r[i] = r;
             box_c[i] = COLS - 1 - c; /* Launchpad ist zur Decke gespiegelt */
         }
-        color_of[led_index(8, y)] = r;
+        if (r < N_COLORS) color_of[led_index(8, y)] = r;
+        else func_of[led_index(8, y)] = 4 + (r - N_COLORS); /* Effekte */
     }
-    func_of[led_index(9, 8)] = 0;
-    func_of[led_index(9, 7)] = 1;
-    func_of[led_index(9, 6)] = 2;
-    func_of[led_index(9, 5)] = 3;
-    for (int k = 0; k < N_EFFECTS; k++) func_of[led_index(9, 4 - k)] = 4 + k;
+    static const int col9[8] = {F_BRI_UP, F_BRI_DOWN, F_TEMPO_UP, F_TEMPO_DOWN, F_ON, F_OFF, F_ALL, F_GAME};
+    for (int r = 1; r < ROWS; r++) func_of[led_index(9, 9 - r)] = col9[r - 1];
 
     int early[50], n_early = 0;
     double started = now(), last_warn = now() - 25;
@@ -1018,32 +1456,75 @@ static void app_main(void) {
         double last_ok = g_last_ok;
         int ever = g_ever_online;
         pthread_mutex_unlock(&mu);
+        /* eigene, noch nicht bestätigte Änderungen gelten vorerst */
+        for (int r = 0; r < ROWS; r++)
+            for (int c = 0; c < COLS; c++)
+                if (t < lb_until[r][c]) {
+                    memcpy(cur.boxes[r][c], lb[r][c], 3);
+                    if (cur.mode < 0) memcpy(cur.frame[r][c], lb[r][c], 3);
+                }
+        if (t < l_bri_until) cur.brightness = l_bri;
+        if (t < l_speed_until) cur.speed10 = l_speed10;
+        if (t < l_mode_until) cur.mode = l_mode;
 
-        if (n_early && sync) { /* Tasten von vor der Verbindung jetzt nachholen */
+        int ingame = game >= 0;
+        if (n_early && (sync || ingame)) { /* Tasten von vor der Verbindung jetzt nachholen */
             for (int k = 0; k < n_early; k++) on_press(early[k]);
             n_early = 0;
         }
         for (int k = 0; k < n_presses; k++) {
-            if (!sync) {
+            int i = presses[k];
+            if (!sync && !ingame && !(i >= 0 && i < 128 && func_of[i] == F_GAME)) {
                 if (n_early == 50) {
                     memmove(early, early + 1, sizeof(int) * 49);
                     n_early--;
                 }
-                early[n_early++] = presses[k];
+                early[n_early++] = i;
                 continue;
             }
-            on_press(presses[k]);
+            on_press(i);
         }
+        ingame = game >= 0;
 
         if (deselect_at && t >= deselect_at) {
             sel_clear();
             deselect_at = 0;
         }
-        if (ever && t - fmax(last_ok, started) > 45) {
+        if (ever && !ingame && t - fmax(last_ok, started) > 60) {
             say("Decke weg, starte neu");
             exit(1);
         }
         memset(want, 0, sizeof want);
+        int blink_on = ((long)(t * 3)) % 2 == 0;
+
+        if (ingame) { /* Spiel: Feld direkt aufs Launchpad, Bild an die Decke */
+            game_tick(t);
+            game_send(t);
+            for (int i = 0; i < 128; i++) {
+                if (is_box[i]) {
+                    const uint8_t *p = gpix[box_r[i]][COLS - 1 - box_c[i]];
+                    set_led(i, p[0], p[1], p[2]);
+                } else if (color_of[i] >= 0) {
+                    static const uint8_t keys[5][3] = {{160, 0, 255}, {255, 255, 255}, {255, 255, 255}, {0, 60, 255}, {255, 0, 0}};
+                    const uint8_t *c = keys[color_of[i]];
+                    if (game == 0) set_led(i, c[0], c[1], c[2]); /* Tetris: drehen, links, rechts, runter, fallen */
+                    else set_led(i, 0, 0, 0);
+                } else if (func_of[i] >= 0) {
+                    int f = func_of[i];
+                    if (f == F_GAME) {
+                        int on = blink_on;
+                        if (game == 0) set_led(i, 0, on ? 255 : 60, on ? 255 : 60);
+                        else set_led(i, on ? 255 : 60, on ? 120 : 30, 0);
+                    } else if (f == F_OFF) set_led(i, 255, 0, 0);
+                    else if (f == F_BRI_UP) set_led(i, 255, 255, 255);
+                    else if (f == F_BRI_DOWN) set_led(i, 40, 40, 40);
+                    else set_led(i, 0, 0, 0);
+                }
+            }
+            lp_show();
+            continue;
+        }
+
         if (!sync) { /* warten: Kästen blinken langsam blau */
             if (t - last_warn > 30) {
                 last_warn = t;
@@ -1052,15 +1533,17 @@ static void app_main(void) {
             sel_clear();
             deselect_at = 0;
             int on = ((long)t) % 2 == 0;
+            static const uint8_t stage_col[4][3] = {{60, 0, 0}, {0, 0, 40}, {40, 0, 40}, {50, 40, 0}};
+            const uint8_t *sc = stage_col[g_stage & 3];
             for (int i = 0; i < 128; i++) {
-                if (is_box[i]) set_led(i, 0, 0, on ? 40 : 0);
+                if (is_box[i]) set_led(i, on ? sc[0] : 0, on ? sc[1] : 0, on ? sc[2] : 0);
+                else if (func_of[i] == F_GAME) set_led(i, 255, 0, 255); /* Spiele gehen auch ohne Decke */
                 else if (color_of[i] >= 0 || func_of[i] >= 0) set_led(i, 0, 0, 0);
             }
             lp_show();
             continue;
         }
 
-        int blink_on = ((long)(t * 3)) % 2 == 0;
         double level = (double)cur.brightness / cur.max;
         for (int i = 0; i < 128; i++) {
             if (is_box[i]) {
@@ -1077,10 +1560,14 @@ static void app_main(void) {
                 set_led(i, c[0], c[1], c[2]);
             } else if (func_of[i] >= 0) {
                 int f = func_of[i];
-                if (f == 0) set_led(i, 0, 255, 0);
-                else if (f == 1) set_led(i, 255, 0, 0);
-                else if (f == 2) set_led(i, 255, 255, 255);
-                else if (f == 3) set_led(i, 40, 40, 40);
+                if (f == F_ON) set_led(i, 0, 255, 0);
+                else if (f == F_OFF) set_led(i, 255, 0, 0);
+                else if (f == F_BRI_UP) set_led(i, 255, 255, 255);
+                else if (f == F_BRI_DOWN) set_led(i, 40, 40, 40);
+                else if (f == F_TEMPO_UP) set_led(i, 0, 255, 255);
+                else if (f == F_TEMPO_DOWN) set_led(i, 0, 50, 50);
+                else if (f == F_ALL) set_led(i, n_sel == ROWS * COLS && !blink_on ? 0 : 255, n_sel == ROWS * COLS && !blink_on ? 0 : 200, 0);
+                else if (f == F_GAME) set_led(i, 255, 0, 255);
                 else {
                     const uint8_t *c = EFFECT_COLOR[f - 4];
                     int running = cur.mode >= 0 && cur.mode < N_ESP_EFFECTS &&
@@ -1119,6 +1606,44 @@ static void load_modules(void) {
 /* normal.txt auf der Boot-Partition? Dann normales Raspberry Pi OS starten.
  * Das System kann auf der SD-Karte (mmcblk0) oder einem USB-Stick (sda) liegen. */
 static char root_dev[32];
+static int have_update; /* neuere Programmversion vom Stick/SD geladen */
+
+#ifdef __aarch64__
+#define MY_BIN "led-mini-aarch64"
+#else
+#define MY_BIN "led-mini-armhf"
+#endif
+
+/* Liegt auf der Boot-Partition in led-mini/ eine andere Programmversion als die
+ * eingebaute? Dann in den Arbeitsspeicher kopieren und die benutzen.
+ * So reicht für Updates: neue Datei in den Ordner led-mini kopieren. */
+static void load_update(void) {
+    FILE *in = fopen("/boot/led-mini/" MY_BIN, "rb");
+    if (!in) return;
+    FILE *self = fopen("/init", "rb");
+    FILE *out = fopen("/led-mini-neu", "wb");
+    int differs = 0;
+    long n = 0;
+    char a[65536], b[65536];
+    size_t k;
+    while (out && (k = fread(a, 1, sizeof a, in)) > 0) {
+        size_t k2 = self ? fread(b, 1, k, self) : 0;
+        if (k2 != k || memcmp(a, b, k)) differs = 1;
+        fwrite(a, 1, k, out);
+        n += k;
+    }
+    if (self && fread(b, 1, 1, self) == 1) differs = 1;
+    fclose(in);
+    if (self) fclose(self);
+    if (out) fclose(out);
+    if (out && differs && n > 100000) {
+        chmod("/led-mini-neu", 0755);
+        have_update = 1;
+        say("Neue Programmversion vom Stick geladen (%ld Bytes)", n);
+    } else {
+        unlink("/led-mini-neu");
+    }
+}
 
 static int want_normal(void) {
     static const char *boot[] = {"/dev/mmcblk0p1", "/dev/sda1"};
@@ -1135,6 +1660,7 @@ static int want_normal(void) {
         return 0;
     }
     snprintf(root_dev, sizeof root_dev, "%s", root[which]);
+    load_update();
     int normal = 0;
     DIR *d = opendir("/boot");
     if (d) {
@@ -1192,7 +1718,13 @@ int main(int argc, char **argv) {
         app_main();
         _exit(1);
     }
-    if (want_normal()) {
+    int normal = want_normal();
+    if (have_update && !normal) { /* auf die neue Version umsteigen */
+        kill(app, SIGKILL);
+        waitpid(app, NULL, 0);
+        app = -1;
+    }
+    if (normal) {
         kill(app, SIGKILL);
         waitpid(app, NULL, 0);
         switch_to_normal();
@@ -1206,6 +1738,7 @@ int main(int argc, char **argv) {
             if (app > 0) msleep(300);
             app = fork();
             if (app == 0) {
+                if (have_update) execl("/led-mini-neu", "led-mini", (char *)NULL);
                 app_main();
                 _exit(1);
             }
