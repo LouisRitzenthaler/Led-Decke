@@ -555,7 +555,7 @@ static int read_state(void) {
 
 /* Wo steht die Bluetooth-Verbindung? Das Launchpad zeigt es beim Warten als Farbe:
  * 0 rot = Bluetooth startet, 1 blau = suche die Decke, 2 lila = Decke gefunden, verbinde,
- * 3 gelb = verbunden, lese den Zustand */
+ * 3 gelb = verbunden, frage die Decke ab, 4 türkis = lese den Zustand, 5 weiß = Zustand unlesbar */
 static volatile int g_stage;
 
 /* Bluetooth-Chip aus- und wieder einschalten (wenn sich nichts mehr verbinden lässt) */
@@ -598,7 +598,10 @@ static void *ble_thread(void *arg) {
             g_stage = 3;
             fcntl(att_fd, F_SETFL, 0);
             att_mtu = 23;
+            double t_conn = now();
+            int got_state = 0;
             if (att_setup() == 0) {
+                g_stage = 4;
                 say("Decke per Bluetooth verbunden");
                 pthread_mutex_lock(&mu);
                 int stale = now() - g_last_ok > 10;
@@ -607,7 +610,6 @@ static void *ble_thread(void *arg) {
                 int have = 0;
                 double last_read = 0;
                 if (read_state() == 0) {
-                    fails = 0;
                     last_read = now();
                     for (;;) {
                         if (!have) have = pop(pending);
@@ -620,6 +622,12 @@ static void *ble_thread(void *arg) {
                         if (now() - last_read >= POLL_S) {
                             last_read = now();
                             if (read_state() < 0) break;
+                            pthread_mutex_lock(&mu);
+                            int fresh = g_have_state && now() - g_last_ok < 1;
+                            pthread_mutex_unlock(&mu);
+                            if (fresh) got_state = 1;
+                            else g_stage = 5;
+                            if (!fresh && now() - t_conn > 5) break; /* 5 s lang nichts Lesbares: neu verbinden */
                         } else {
                             msleep(10);
                         }
@@ -629,6 +637,9 @@ static void *ble_thread(void *arg) {
             }
             close(att_fd);
             att_fd = -1;
+            /* Verbindung hat lange gehalten: alles gut. Sonst zählt es als Fehlversuch. */
+            if (got_state && now() - t_conn > 30) fails = 0;
+            else fails++;
         }
         msleep(200); /* gleich neu verbinden; das Launchpad zeigt bis 10 s weiter den letzten Stand */
     }
@@ -1533,8 +1544,8 @@ static void app_main(void) {
             sel_clear();
             deselect_at = 0;
             int on = ((long)t) % 2 == 0;
-            static const uint8_t stage_col[4][3] = {{60, 0, 0}, {0, 0, 40}, {40, 0, 40}, {50, 40, 0}};
-            const uint8_t *sc = stage_col[g_stage & 3];
+            static const uint8_t stage_col[6][3] = {{60, 0, 0}, {0, 0, 40}, {40, 0, 40}, {50, 40, 0}, {0, 40, 40}, {40, 40, 40}};
+            const uint8_t *sc = stage_col[g_stage % 6];
             for (int i = 0; i < 128; i++) {
                 if (is_box[i]) set_led(i, on ? sc[0] : 0, on ? sc[1] : 0, on ? sc[2] : 0);
                 else if (func_of[i] == F_GAME) set_led(i, 255, 0, 255); /* Spiele gehen auch ohne Decke */
