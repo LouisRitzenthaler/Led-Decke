@@ -1,13 +1,17 @@
 // LED-Decke – Firmware für EINEN ESP32, der alle 14 Streifen steuert
 //
 // Der ESP32 verbindet sich per Bluetooth mit der Steuerseite am Handy und mit
-// dem Raspberry Pi (Launchpad). Nur Updates gehen per WLAN (OTA).
+// dem Raspberry Pi (Launchpad). Updates (OTA) gehen per WLAN.
+// NEU: Solange das WLAN verbunden ist, nimmt die Decke dieselben JSON-Befehle
+// auch per HTTP an (POST /api) und zeigt ihren Zustand unter GET /state.
+// Erreichbar unter http://led-decke-reihe1.local oder http://<IP>.
 // Einstellungen stehen direkt hier unten.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <HTTPUpdateServer.h>
 #include <Update.h>
 #include <Adafruit_NeoPixel.h>
@@ -172,6 +176,8 @@ WebServer web(80);
 HTTPUpdateServer webUpdater;
 bool otaStarted = false;
 void bluetoothPause(bool pause);
+const char *runCommand(JsonDocument &doc);  // weiter unten
+String stateJson();                         // weiter unten
 unsigned long lastWifiTry = 0;
 unsigned long wifiUntil = 120000;  // bis dahin (ms seit Start) darf das WLAN suchen
 bool wifiOff = false;
@@ -187,6 +193,31 @@ void startWifi() {
     Serial.print('.');
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? " verbunden" : " noch nicht da, versuche weiter");
+}
+
+// HTTP: POST /api mit demselben JSON wie bei Bluetooth, z. B. {"op":"settings","mode":"rainbow"}
+void sendJson(int code, const String &body) {
+  web.send(code, "application/json", body);
+}
+
+void httpApi() {
+  String body = web.arg("plain");  // nur gefüllt, wenn Content-Type NICHT form-urlencoded ist
+  if (!body.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"leerer Body - Content-Type: application/json setzen\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    sendJson(400, "{\"ok\":false,\"error\":\"kein gueltiges JSON\"}");
+    return;
+  }
+  const char *err = runCommand(doc);
+  if (err) sendJson(400, String("{\"ok\":false,\"error\":\"") + err + "\"}");
+  else sendJson(200, "{\"ok\":true}");
+}
+
+void httpState() {
+  sendJson(200, stateJson());
 }
 
 // In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
@@ -212,9 +243,12 @@ void handleNetwork() {
     // Während des Updates Bluetooth trennen, sonst bricht das Update ab
     ArduinoOTA.onStart([] { Serial.println("Update startet ..."); bluetoothPause(true); });
     ArduinoOTA.onError([](ota_error_t) { bluetoothPause(false); });
-    ArduinoOTA.begin();
+    ArduinoOTA.begin();  // startet auch mDNS: led-decke-reihe1.local
+    MDNS.addService("http", "tcp", 80);
     webUpdater.setup(&web);  // Notfall-Update im Browser: http://IP/update
-    web.on("/", [] { web.send(200, "text/plain", "LED-Decke laeuft"); });
+    web.on("/", [] { web.send(200, "text/plain", "LED-Decke laeuft. POST /api (JSON), GET /state"); });
+    web.on("/api", HTTP_POST, httpApi);
+    web.on("/state", HTTP_GET, httpState);
     web.begin();
     Serial.printf("WLAN ok: http://%s, Update-Name \"%s\"\n", WiFi.localIP().toString().c_str(), HOSTNAME);
   }
@@ -623,15 +657,46 @@ const char *cmdFrame(JsonDocument &doc) {
 }
 
 // Befehle als JSON: {"op":"boxes"|"fill"|"settings"|"frame"|"scene_save"|"scene_load"|"scene_delete"|"get", ...}
-void runCommand(JsonDocument &doc) {
+// Rückgabe: nullptr = ok, sonst Fehlertext (Bluetooth und UDP ignorieren ihn, HTTP meldet ihn zurück)
+const char *runCommand(JsonDocument &doc) {
   String op = doc["op"] | "";
-  if (op == "boxes") cmdBoxes(doc);
-  else if (op == "fill") cmdFill(doc);
-  else if (op == "settings") cmdSettings(doc);
-  else if (op == "frame") cmdFrame(doc);
-  else if (op == "scene_save") cmdScene('s', doc["name"] | "");
-  else if (op == "scene_load") cmdScene('l', doc["name"] | "");
-  else if (op == "scene_delete") cmdScene('d', doc["name"] | "");
+  if (op == "get") return nullptr;
+  if (op == "boxes") return cmdBoxes(doc);
+  if (op == "fill") return cmdFill(doc);
+  if (op == "settings") return cmdSettings(doc);
+  if (op == "frame") return cmdFrame(doc);
+  if (op == "scene_save") return cmdScene('s', doc["name"] | "");
+  if (op == "scene_load") return cmdScene('l', doc["name"] | "");
+  if (op == "scene_delete") return cmdScene('d', doc["name"] | "");
+  return "op";
+}
+
+// Zustand als lesbares JSON (für GET /state)
+String stateJson() {
+  JsonDocument d;
+  {
+    Lock l;
+    d["mode"] = mode == -1 ? "static" : mode == -2 ? "game" : EFFECT_IDS[mode];
+    d["brightness"] = brightness;
+    d["max_brightness"] = MAX_BRIGHTNESS;
+    d["speed"] = speed;
+    char hex[8];
+    snprintf(hex, sizeof(hex), "#%02x%02x%02x", fxColor.r, fxColor.g, fxColor.b);
+    d["color"] = hex;
+    d["mic_sens"] = micSens;
+    JsonArray sc = d["scenes"].to<JsonArray>();
+    for (int i = 0; i < MAX_SCENES; i++)
+      if (scenes[i].name[0]) sc.add(scenes[i].name);
+  }
+  JsonArray ef = d["effects"].to<JsonArray>();
+  for (int i = 0; i < NUM_EFFECTS; i++) ef.add(EFFECT_IDS[i]);
+  d["wifi_rssi"] = WiFi.RSSI();
+  NimBLEServer *srv = NimBLEDevice::getServer();
+  d["ble_clients"] = srv ? srv->getConnectedCount() : 0;
+  d["uptime_s"] = millis() / 1000;
+  String out;
+  serializeJson(d, out);
+  return out;
 }
 
 class StateCallbacks : public NimBLECharacteristicCallbacks {
