@@ -189,7 +189,9 @@ const UUID = {
 const EFFECTS = [["rainbow", "Regenbogen"], ["colorfade", "Farbwechsel"], ["wave", "Welle"],
   ["breathe", "Atmen"], ["sparkle", "Funkeln"], ["rain", "Regen"], ["wiring_test", "Verkabelungstest"],
   ["music_pulse", "Puls"], ["music_vu", "Pegel"], ["music_beat", "Beat-Farben"],
-  ["music_switch", "Bass-Wechsel"], ["launch", "Launchpad-Start"]]
+  ["music_switch", "Bass-Wechsel"], ["launch", "Launchpad-Start"],
+  ["fire", "Feuer"], ["aurora", "Polarlicht"], ["matrix", "Matrix-Regen"], ["meteor", "Sternschnuppen"],
+  ["plasma", "Plasma"], ["comet", "Komet"], ["ocean", "Ozean"], ["lava", "Lava"]]
   .map(([id, name]) => ({ id, name }));
 let ble = null, sceneNames = [], bleChain = Promise.resolve();
 const enc = new TextEncoder(), dec = new TextDecoder();

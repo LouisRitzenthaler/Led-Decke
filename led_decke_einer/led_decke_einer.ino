@@ -286,9 +286,12 @@ struct Scene {
 Scene scenes[MAX_SCENES];
 
 const char *EFFECT_IDS[] = {"rainbow", "colorfade", "wave", "breathe", "sparkle", "rain", "wiring_test",
-                            "music_pulse", "music_vu", "music_beat", "music_switch", "launch"};
+                            "music_pulse", "music_vu", "music_beat", "music_switch", "launch",
+                            "fire", "aurora", "matrix", "meteor", "plasma", "comet", "ocean", "lava"};
 const char *EFFECT_NAMES[] = {"Regenbogen", "Farbwechsel", "Welle", "Atmen", "Funkeln", "Regen", "Verkabelungstest",
-                              "Puls", "Pegel", "Beat-Farben", "Bass-Wechsel", "Launchpad-Start"};
+                              "Puls", "Pegel", "Beat-Farben", "Bass-Wechsel", "Launchpad-Start",
+                              "Feuer", "Polarlicht", "Matrix-Regen", "Sternschnuppen", "Plasma", "Komet",
+                              "Ozean", "Lava"};
 const int NUM_EFFECTS = sizeof(EFFECT_IDS) / sizeof(EFFECT_IDS[0]);
 const int WIRING_TEST = 6;
 
@@ -426,7 +429,168 @@ uint8_t sparkHue[ROWS][COLS];
 float dropStart[COLS];
 float dropWait[COLS];
 
+
+// ---------------------------------------------------------------------
+//  Neue Effekte (ab Index 12): Hilfsfunktionen und Zustand
+// ---------------------------------------------------------------------
+CRGB mixColor(CRGB a, CRGB b, float k) {  // k = 0 -> a, k = 1 -> b
+  k = constrain(k, 0.0f, 1.0f);
+  return CRGB(a.r + (b.r - a.r) * k, a.g + (b.g - a.g) * k, a.b + (b.b - a.b) * k);
+}
+
+// Hitze 0..1 -> schwarz, rot, orange, gelb, weiß
+CRGB heatColor(float h) {
+  h = constrain(h, 0.0f, 1.0f) * 3;
+  return CRGB(255 * min(1.0f, h), 255 * constrain(h - 1, 0.0f, 1.0f), 255 * constrain(h - 2, 0.0f, 1.0f));
+}
+
+float fireHeat[COLS][ROWS];   // Index 0 = unten
+float fireLastT = 0;
+float matrixPos[COLS], matrixSpd[COLS];
+bool matrixInit = false;
+float matrixLastT = 0;
+const int NUM_METEORS = 4;
+float meteorT0[NUM_METEORS], meteorRow[NUM_METEORS], meteorCol[NUM_METEORS], meteorSpd[NUM_METEORS];
+bool meteorInit = false;
+
+void spawnMeteor(int i, float now) {
+  meteorT0[i] = now;
+  meteorRow[i] = -random(0, 40) / 10.0f;
+  meteorCol[i] = random(0, (COLS + 6) * 10) / 10.0f;
+  meteorSpd[i] = 5.0f + random(0, 40) / 10.0f;
+}
+
+void renderNewEffect(int m) {
+  switch (m) {
+    case 12: {  // Feuer: von unten aufsteigende Hitze (feste Feuerfarben)
+      int steps = (int)((t - fireLastT) * 20);
+      if (steps > 4) steps = 4;
+      if (steps > 0) fireLastT = t;
+      for (int s = 0; s < steps; s++)
+        for (int c = 0; c < COLS; c++) {
+          float *h = fireHeat[c];
+          for (int k = 0; k < ROWS; k++) h[k] = max(0.0f, h[k] - random(0, 60) / 255.0f);
+          for (int k = ROWS - 1; k >= 2; k--) h[k] = (h[k - 1] + h[k - 2] + h[k - 2]) / 3.0f;
+          if (random(255) < 130) {
+            int y = random(min(3, ROWS));
+            h[y] = min(1.0f, h[y] + random(160, 255) / 255.0f);
+          }
+        }
+      for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) frame[r][c] = heatColor(fireHeat[c][ROWS - 1 - r]);
+      break;
+    }
+    case 13:  // Polarlicht: grün-violette Schleier wandern (feste Farben)
+      for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) {
+          float a = (sinf(c * 0.8f + t * 0.5f + sinf(r * 0.45f + t * 0.3f) * 1.6f) + 1) / 2;
+          float b = (sinf(c * 0.35f - t * 0.27f + r * 0.3f) + 1) / 2;
+          float v = 0.04f + 0.96f * a * a;
+          frame[r][c] = hue(0.30f + 0.42f * b, 255, 255 * v);
+        }
+      break;
+    case 14: {  // Matrix-Regen: helle Köpfe mit Schweif in der Effekt-Farbe fallen nach unten
+      if (!matrixInit) {
+        matrixInit = true;
+        for (int c = 0; c < COLS; c++) {
+          matrixPos[c] = -random(0, 100) / 10.0f;
+          matrixSpd[c] = 3.0f + random(0, 40) / 10.0f;
+        }
+      }
+      float dt = t - matrixLastT;
+      matrixLastT = t;
+      if (dt < 0 || dt > 1) dt = 0;
+      fillFrame(BLACK);
+      for (int c = 0; c < COLS; c++) {
+        matrixPos[c] += dt * matrixSpd[c];
+        if (matrixPos[c] > ROWS + 6) {
+          matrixPos[c] = -random(0, 30) / 10.0f;
+          matrixSpd[c] = 3.0f + random(0, 40) / 10.0f;
+        }
+        for (int r = 0; r < ROWS; r++) {
+          float d = matrixPos[c] - r;  // Abstand hinter dem Kopf
+          if (d < 0 || d > 6) continue;
+          frame[r][c] = d < 1 ? mixColor(fxColor, WHITE, 0.7f) : scaled(fxColor, (1 - d / 6) * (0.6f + 0.4f * random(100) / 100.0f));
+        }
+      }
+      break;
+    }
+    case 15: {  // Sternschnuppen: weiße Streifen mit Schweif ziehen schräg über die Decke
+      if (!meteorInit) {
+        meteorInit = true;
+        for (int i = 0; i < NUM_METEORS; i++) spawnMeteor(i, t);
+      }
+      fillFrame(BLACK);
+      for (int i = 0; i < NUM_METEORS; i++) {
+        float age = t - meteorT0[i];
+        float hr = meteorRow[i] + age * meteorSpd[i];            // läuft nach unten ...
+        float hc = meteorCol[i] - age * meteorSpd[i] * 0.5f;     // ... und nach links
+        if (hr > ROWS + 7) {
+          spawnMeteor(i, t);
+          continue;
+        }
+        const float DR = 0.894f, DC = -0.447f;  // Flugrichtung (normiert)
+        for (int r = 0; r < ROWS; r++)
+          for (int c = 0; c < COLS; c++) {
+            float dr = r - hr, dc = c - hc;
+            float behind = -(dr * DR + dc * DC);
+            float side = fabsf(dr * DC - dc * DR);
+            if (behind < -0.3f || behind > 6 || side > 0.8f) continue;
+            float v = (1 - max(0.0f, behind) / 6) * (1 - side / 0.8f);
+            CRGB col = mixColor(WHITE, fxColor, behind / 6);
+            CRGB &px = frame[r][c];
+            CRGB add = scaled(col, v);
+            px = CRGB(min(255, px.r + add.r), min(255, px.g + add.g), min(255, px.b + add.b));
+          }
+      }
+      break;
+    }
+    case 16:  // Plasma: ineinanderfließende Farben (Regenbogen-Farben)
+      for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) {
+          float v = sinf(c * 0.9f + t) + sinf(r * 0.6f - t * 1.3f) + sinf((c + r) * 0.5f + t * 0.7f) +
+                    sinf(sqrtf((c - 3.0f) * (c - 3.0f) + (r - 4.0f) * (r - 4.0f)) * 0.9f - t);
+          frame[r][c] = hue(v / 8 + 0.5f + t * 0.03f);
+        }
+      break;
+    case 17: {  // Komet: ein Lichtpunkt mit Schweif läuft im Zickzack durch alle Reihen
+      const int N = ROWS * COLS, TAIL = 14;
+      int head = (int)(t * 12) % N;
+      fillFrame(BLACK);
+      for (int k = TAIL; k >= 0; k--) {
+        int i = ((head - k) % N + N) % N;
+        int col = i / ROWS, row = (col % 2 == 0) ? i % ROWS : ROWS - 1 - i % ROWS;
+        frame[row][col] = k == 0 ? WHITE : scaled(fxColor, powf(1 - (float)k / (TAIL + 1), 1.5f));
+      }
+      break;
+    }
+    case 18:  // Ozean: Wellen in der Effekt-Farbe, auf den Kämmen weißer Schaum
+      for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) {
+          float w1 = (sinf(r * 0.7f - t * 1.2f + c * 0.35f) + 1) / 2;
+          float w2 = (sinf(r * 0.4f + t * 0.8f - c * 0.5f) + 1) / 2;
+          float v = 0.15f + 0.85f * (0.65f * w1 + 0.35f * w2);
+          CRGB col = scaled(fxColor, v);
+          frame[r][c] = v > 0.88f ? mixColor(col, WHITE, (v - 0.88f) * 6) : col;
+        }
+      break;
+    case 19:  // Lava: langsame glühende Blasen (feste Lavafarben)
+      for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) {
+          float n = sinf(c * 0.6f + t * 0.3f) + sinf(r * 0.45f - t * 0.25f + sinf(c * 0.5f + t * 0.2f)) +
+                    sinf((r + c) * 0.4f + t * 0.15f);
+          float v = (n + 3) / 6;
+          frame[r][c] = heatColor(0.08f + 0.62f * v * v);
+        }
+      break;
+  }
+}
+
 void renderEffect() {
+  if (mode >= 12) {
+    renderNewEffect(mode);
+    return;
+  }
   switch (mode) {
     case 0:  // Regenbogen
       for (int r = 0; r < ROWS; r++)
