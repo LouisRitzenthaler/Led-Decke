@@ -49,6 +49,12 @@ const bool B_STARTS_AT_TOP[COLS] = {true, true, true, true, true, true, true};
 #define MAX_BRIGHTNESS 160
 #define FPS 20
 #define MAX_SCENES 10
+// Bluetooth-Selbstheilung: ist 30 Minuten lang niemand verbunden, wird Bluetooth
+// einmal komplett neu gestartet (ca. 1 Sekunde nicht sichtbar). 0 = nie.
+#define BLE_IDLE_RESTART_MS (30UL * 60UL * 1000UL)
+// Sind alle Bluetooth-Plätze belegt, aber 10 Minuten lang kam nichts mehr an
+// (Geisterverbindung), werden alle Verbindungen getrennt.
+#define BLE_GHOST_MS (10UL * 60UL * 1000UL)
 // =============================================================
 
 #define BLE_SERVICE_UUID "6e1d0001-8a3c-4c5b-9b1e-1ed0c0dec0de"
@@ -623,6 +629,10 @@ String sceneNamesJson() {  // Aufrufer hält den Lock
 //  Bluetooth (BLE)
 // ---------------------------------------------------------------------
 NimBLECharacteristic *bleState, *bleScenes, *bleMic;
+volatile unsigned long lastBleActivity = 0;  // zuletzt kam ein Befehl / wurde etwas gelesen
+volatile unsigned long lastBleClient = 0;    // zuletzt war jemand verbunden
+volatile bool bleRestartRequested = false;   // wird in loop() ausgeführt
+uint32_t bleRestarts = 0;
 
 // Zustand binär: [1, mode, helligkeit, max, tempo*10, r,g,b, rows, cols, boxes..., frame...]
 const size_t STATE_SIZE = 10 + ROWS * COLS * 6;
@@ -661,6 +671,7 @@ const char *cmdFrame(JsonDocument &doc) {
 const char *runCommand(JsonDocument &doc) {
   String op = doc["op"] | "";
   if (op == "get") return nullptr;
+  if (op == "ble_restart") { bleRestartRequested = true; return nullptr; }  // Bluetooth neu starten
   if (op == "boxes") return cmdBoxes(doc);
   if (op == "fill") return cmdFill(doc);
   if (op == "settings") return cmdSettings(doc);
@@ -693,6 +704,11 @@ String stateJson() {
   d["wifi_rssi"] = WiFi.RSSI();
   NimBLEServer *srv = NimBLEDevice::getServer();
   d["ble_clients"] = srv ? srv->getConnectedCount() : 0;
+  d["ble_advertising"] = srv ? NimBLEDevice::getAdvertising()->isAdvertising() : false;
+  d["ble_restarts"] = bleRestarts;
+  d["ble_idle_s"] = (millis() - lastBleClient) / 1000;
+  d["free_heap"] = ESP.getFreeHeap();
+  d["min_free_heap"] = ESP.getMinFreeHeap();
   d["uptime_s"] = millis() / 1000;
   String out;
   serializeJson(d, out);
@@ -701,6 +717,7 @@ String stateJson() {
 
 class StateCallbacks : public NimBLECharacteristicCallbacks {
   void onRead(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    lastBleActivity = millis();
     static uint8_t buf[STATE_SIZE];
     buildState(buf);
     c->setValue(buf, sizeof(buf));
@@ -727,6 +744,7 @@ class MicCallbacks : public NimBLECharacteristicCallbacks {
 
 class CmdCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    lastBleActivity = millis();
     JsonDocument doc;
     NimBLEAttValue v = c->getValue();
     if (deserializeJson(doc, (const char *)v.data(), v.length())) return;
@@ -737,6 +755,7 @@ class CmdCallbacks : public NimBLECharacteristicCallbacks {
 // Nach jeder Verbindung weiter sichtbar bleiben: Handy und Raspberry Pi gleichzeitig
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *srv, NimBLEConnInfo &info) override {
+    lastBleClient = lastBleActivity = millis();
     if (srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) NimBLEDevice::startAdvertising();
   }
 };
@@ -775,7 +794,49 @@ void startBle() {
   adv->addServiceUUID(BLE_SERVICE_UUID);
   adv->enableScanResponse(true);
   adv->start();
+  lastBleClient = lastBleActivity = millis();
   Serial.printf("Bluetooth bereit: \"%s\"\n", BLE_NAME);
+}
+
+// Bluetooth komplett abbauen und neu aufbauen (letzter Ausweg bei hängendem Bluetooth)
+void restartBle(const char *why) {
+  Serial.printf("Bluetooth wird neu gestartet (%s)\n", why);
+  NimBLEDevice::deinit(true);
+  delay(300);
+  startBle();
+  bleRestarts++;
+}
+
+// Alle 3 Sekunden aus loop(): Bluetooth am Leben halten
+void bleMaintenance() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 3000) return;
+  lastCheck = now;
+  if (blePaused || Update.isRunning()) return;
+  if (bleRestartRequested) {
+    bleRestartRequested = false;
+    restartBle("angefordert");
+    return;
+  }
+  NimBLEServer *srv = NimBLEDevice::getServer();
+  if (!srv) {
+    restartBle("kein Server");
+    return;
+  }
+  int n = srv->getConnectedCount();
+  if (n > 0) lastBleClient = now;
+  // Solange ein Platz frei ist, muss die Decke sichtbar und verbindbar sein
+  if (n < CONFIG_BT_NIMBLE_MAX_CONNECTIONS && !NimBLEDevice::getAdvertising()->isAdvertising())
+    NimBLEDevice::startAdvertising();
+  // Alle Plätze belegt, aber lange nichts passiert: Geisterverbindungen trennen
+  if (n >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS && now - lastBleActivity > BLE_GHOST_MS) {
+    Serial.println("Bluetooth: Geisterverbindungen werden getrennt");
+    for (uint16_t h : srv->getPeerDevices()) srv->disconnect(h);
+    lastBleActivity = now;
+  }
+  // Lange niemand verbunden: Bluetooth vorsorglich neu starten
+  if (BLE_IDLE_RESTART_MS > 0 && n == 0 && now - lastBleClient > BLE_IDLE_RESTART_MS) restartBle("lange ohne Verbindung");
 }
 // ---------------------------------------------------------------------
 //  Launchpad am Raspberry Pi: dieselben Befehle per WLAN (UDP).
@@ -825,16 +886,8 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long lastFrame = 0, lastAdvCheck = 0;
-  // Sicherheitsnetz: Solange noch ein Platz frei ist, muss die Decke per Bluetooth
-  // sichtbar sein. Sonst findet das Launchpad sie nach einem Abbruch nicht wieder.
-  if (millis() - lastAdvCheck > 3000) {
-    lastAdvCheck = millis();
-    NimBLEServer *srv = NimBLEDevice::getServer();
-    if (srv && !blePaused && srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS &&
-        !NimBLEDevice::getAdvertising()->isAdvertising())
-      NimBLEDevice::startAdvertising();
-  }
+  static unsigned long lastFrame = 0;
+  bleMaintenance();
   handleNetwork();
   handleUdp();
   unsigned long now = millis();
