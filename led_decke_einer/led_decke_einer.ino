@@ -1,13 +1,17 @@
 // LED-Decke – Firmware für EINEN ESP32, der alle 14 Streifen steuert
 //
 // Der ESP32 verbindet sich per Bluetooth mit der Steuerseite am Handy und mit
-// dem Raspberry Pi (Launchpad). Nur Updates gehen per WLAN (OTA).
+// dem Raspberry Pi (Launchpad). Updates (OTA) gehen per WLAN.
+// NEU: Solange das WLAN verbunden ist, nimmt die Decke dieselben JSON-Befehle
+// auch per HTTP an (POST /api) und zeigt ihren Zustand unter GET /state.
+// Erreichbar unter http://led-decke-reihe1.local oder http://<IP>.
 // Einstellungen stehen direkt hier unten.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <HTTPUpdateServer.h>
 #include <Update.h>
 #include <Adafruit_NeoPixel.h>
@@ -45,6 +49,12 @@ const bool B_STARTS_AT_TOP[COLS] = {true, true, true, true, true, true, true};
 #define MAX_BRIGHTNESS 160
 #define FPS 20
 #define MAX_SCENES 10
+// Bluetooth-Selbstheilung: ist 30 Minuten lang niemand verbunden, wird Bluetooth
+// einmal komplett neu gestartet (ca. 1 Sekunde nicht sichtbar). 0 = nie.
+#define BLE_IDLE_RESTART_MS (30UL * 60UL * 1000UL)
+// Sind alle Bluetooth-Plätze belegt, aber 10 Minuten lang kam nichts mehr an
+// (Geisterverbindung), werden alle Verbindungen getrennt.
+#define BLE_GHOST_MS (10UL * 60UL * 1000UL)
 // =============================================================
 
 #define BLE_SERVICE_UUID "6e1d0001-8a3c-4c5b-9b1e-1ed0c0dec0de"
@@ -172,6 +182,8 @@ WebServer web(80);
 HTTPUpdateServer webUpdater;
 bool otaStarted = false;
 void bluetoothPause(bool pause);
+const char *runCommand(JsonDocument &doc);  // weiter unten
+String stateJson();                         // weiter unten
 unsigned long lastWifiTry = 0;
 unsigned long wifiUntil = 120000;  // bis dahin (ms seit Start) darf das WLAN suchen
 bool wifiOff = false;
@@ -187,6 +199,31 @@ void startWifi() {
     Serial.print('.');
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? " verbunden" : " noch nicht da, versuche weiter");
+}
+
+// HTTP: POST /api mit demselben JSON wie bei Bluetooth, z. B. {"op":"settings","mode":"rainbow"}
+void sendJson(int code, const String &body) {
+  web.send(code, "application/json", body);
+}
+
+void httpApi() {
+  String body = web.arg("plain");  // nur gefüllt, wenn Content-Type NICHT form-urlencoded ist
+  if (!body.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"leerer Body - Content-Type: application/json setzen\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    sendJson(400, "{\"ok\":false,\"error\":\"kein gueltiges JSON\"}");
+    return;
+  }
+  const char *err = runCommand(doc);
+  if (err) sendJson(400, String("{\"ok\":false,\"error\":\"") + err + "\"}");
+  else sendJson(200, "{\"ok\":true}");
+}
+
+void httpState() {
+  sendJson(200, stateJson());
 }
 
 // In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
@@ -212,9 +249,12 @@ void handleNetwork() {
     // Während des Updates Bluetooth trennen, sonst bricht das Update ab
     ArduinoOTA.onStart([] { Serial.println("Update startet ..."); bluetoothPause(true); });
     ArduinoOTA.onError([](ota_error_t) { bluetoothPause(false); });
-    ArduinoOTA.begin();
+    ArduinoOTA.begin();  // startet auch mDNS: led-decke-reihe1.local
+    MDNS.addService("http", "tcp", 80);
     webUpdater.setup(&web);  // Notfall-Update im Browser: http://IP/update
-    web.on("/", [] { web.send(200, "text/plain", "LED-Decke laeuft"); });
+    web.on("/", [] { web.send(200, "text/plain", "LED-Decke laeuft. POST /api (JSON), GET /state"); });
+    web.on("/api", HTTP_POST, httpApi);
+    web.on("/state", HTTP_GET, httpState);
     web.begin();
     Serial.printf("WLAN ok: http://%s, Update-Name \"%s\"\n", WiFi.localIP().toString().c_str(), HOSTNAME);
   }
@@ -589,6 +629,10 @@ String sceneNamesJson() {  // Aufrufer hält den Lock
 //  Bluetooth (BLE)
 // ---------------------------------------------------------------------
 NimBLECharacteristic *bleState, *bleScenes, *bleMic;
+volatile unsigned long lastBleActivity = 0;  // zuletzt kam ein Befehl / wurde etwas gelesen
+volatile unsigned long lastBleClient = 0;    // zuletzt war jemand verbunden
+volatile bool bleRestartRequested = false;   // wird in loop() ausgeführt
+uint32_t bleRestarts = 0;
 
 // Zustand binär: [1, mode, helligkeit, max, tempo*10, r,g,b, rows, cols, boxes..., frame...]
 const size_t STATE_SIZE = 10 + ROWS * COLS * 6;
@@ -623,19 +667,57 @@ const char *cmdFrame(JsonDocument &doc) {
 }
 
 // Befehle als JSON: {"op":"boxes"|"fill"|"settings"|"frame"|"scene_save"|"scene_load"|"scene_delete"|"get", ...}
-void runCommand(JsonDocument &doc) {
+// Rückgabe: nullptr = ok, sonst Fehlertext (Bluetooth und UDP ignorieren ihn, HTTP meldet ihn zurück)
+const char *runCommand(JsonDocument &doc) {
   String op = doc["op"] | "";
-  if (op == "boxes") cmdBoxes(doc);
-  else if (op == "fill") cmdFill(doc);
-  else if (op == "settings") cmdSettings(doc);
-  else if (op == "frame") cmdFrame(doc);
-  else if (op == "scene_save") cmdScene('s', doc["name"] | "");
-  else if (op == "scene_load") cmdScene('l', doc["name"] | "");
-  else if (op == "scene_delete") cmdScene('d', doc["name"] | "");
+  if (op == "get") return nullptr;
+  if (op == "ble_restart") { bleRestartRequested = true; return nullptr; }  // Bluetooth neu starten
+  if (op == "boxes") return cmdBoxes(doc);
+  if (op == "fill") return cmdFill(doc);
+  if (op == "settings") return cmdSettings(doc);
+  if (op == "frame") return cmdFrame(doc);
+  if (op == "scene_save") return cmdScene('s', doc["name"] | "");
+  if (op == "scene_load") return cmdScene('l', doc["name"] | "");
+  if (op == "scene_delete") return cmdScene('d', doc["name"] | "");
+  return "op";
+}
+
+// Zustand als lesbares JSON (für GET /state)
+String stateJson() {
+  JsonDocument d;
+  {
+    Lock l;
+    d["mode"] = mode == -1 ? "static" : mode == -2 ? "game" : EFFECT_IDS[mode];
+    d["brightness"] = brightness;
+    d["max_brightness"] = MAX_BRIGHTNESS;
+    d["speed"] = speed;
+    char hex[8];
+    snprintf(hex, sizeof(hex), "#%02x%02x%02x", fxColor.r, fxColor.g, fxColor.b);
+    d["color"] = hex;
+    d["mic_sens"] = micSens;
+    JsonArray sc = d["scenes"].to<JsonArray>();
+    for (int i = 0; i < MAX_SCENES; i++)
+      if (scenes[i].name[0]) sc.add(scenes[i].name);
+  }
+  JsonArray ef = d["effects"].to<JsonArray>();
+  for (int i = 0; i < NUM_EFFECTS; i++) ef.add(EFFECT_IDS[i]);
+  d["wifi_rssi"] = WiFi.RSSI();
+  NimBLEServer *srv = NimBLEDevice::getServer();
+  d["ble_clients"] = srv ? srv->getConnectedCount() : 0;
+  d["ble_advertising"] = srv ? NimBLEDevice::getAdvertising()->isAdvertising() : false;
+  d["ble_restarts"] = bleRestarts;
+  d["ble_idle_s"] = (millis() - lastBleClient) / 1000;
+  d["free_heap"] = ESP.getFreeHeap();
+  d["min_free_heap"] = ESP.getMinFreeHeap();
+  d["uptime_s"] = millis() / 1000;
+  String out;
+  serializeJson(d, out);
+  return out;
 }
 
 class StateCallbacks : public NimBLECharacteristicCallbacks {
   void onRead(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    lastBleActivity = millis();
     static uint8_t buf[STATE_SIZE];
     buildState(buf);
     c->setValue(buf, sizeof(buf));
@@ -662,6 +744,7 @@ class MicCallbacks : public NimBLECharacteristicCallbacks {
 
 class CmdCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    lastBleActivity = millis();
     JsonDocument doc;
     NimBLEAttValue v = c->getValue();
     if (deserializeJson(doc, (const char *)v.data(), v.length())) return;
@@ -672,6 +755,7 @@ class CmdCallbacks : public NimBLECharacteristicCallbacks {
 // Nach jeder Verbindung weiter sichtbar bleiben: Handy und Raspberry Pi gleichzeitig
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *srv, NimBLEConnInfo &info) override {
+    lastBleClient = lastBleActivity = millis();
     if (srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) NimBLEDevice::startAdvertising();
   }
 };
@@ -710,7 +794,49 @@ void startBle() {
   adv->addServiceUUID(BLE_SERVICE_UUID);
   adv->enableScanResponse(true);
   adv->start();
+  lastBleClient = lastBleActivity = millis();
   Serial.printf("Bluetooth bereit: \"%s\"\n", BLE_NAME);
+}
+
+// Bluetooth komplett abbauen und neu aufbauen (letzter Ausweg bei hängendem Bluetooth)
+void restartBle(const char *why) {
+  Serial.printf("Bluetooth wird neu gestartet (%s)\n", why);
+  NimBLEDevice::deinit(true);
+  delay(300);
+  startBle();
+  bleRestarts++;
+}
+
+// Alle 3 Sekunden aus loop(): Bluetooth am Leben halten
+void bleMaintenance() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 3000) return;
+  lastCheck = now;
+  if (blePaused || Update.isRunning()) return;
+  if (bleRestartRequested) {
+    bleRestartRequested = false;
+    restartBle("angefordert");
+    return;
+  }
+  NimBLEServer *srv = NimBLEDevice::getServer();
+  if (!srv) {
+    restartBle("kein Server");
+    return;
+  }
+  int n = srv->getConnectedCount();
+  if (n > 0) lastBleClient = now;
+  // Solange ein Platz frei ist, muss die Decke sichtbar und verbindbar sein
+  if (n < CONFIG_BT_NIMBLE_MAX_CONNECTIONS && !NimBLEDevice::getAdvertising()->isAdvertising())
+    NimBLEDevice::startAdvertising();
+  // Alle Plätze belegt, aber lange nichts passiert: Geisterverbindungen trennen
+  if (n >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS && now - lastBleActivity > BLE_GHOST_MS) {
+    Serial.println("Bluetooth: Geisterverbindungen werden getrennt");
+    for (uint16_t h : srv->getPeerDevices()) srv->disconnect(h);
+    lastBleActivity = now;
+  }
+  // Lange niemand verbunden: Bluetooth vorsorglich neu starten
+  if (BLE_IDLE_RESTART_MS > 0 && n == 0 && now - lastBleClient > BLE_IDLE_RESTART_MS) restartBle("lange ohne Verbindung");
 }
 // ---------------------------------------------------------------------
 //  Launchpad am Raspberry Pi: dieselben Befehle per WLAN (UDP).
@@ -760,16 +886,8 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long lastFrame = 0, lastAdvCheck = 0;
-  // Sicherheitsnetz: Solange noch ein Platz frei ist, muss die Decke per Bluetooth
-  // sichtbar sein. Sonst findet das Launchpad sie nach einem Abbruch nicht wieder.
-  if (millis() - lastAdvCheck > 3000) {
-    lastAdvCheck = millis();
-    NimBLEServer *srv = NimBLEDevice::getServer();
-    if (srv && !blePaused && srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS &&
-        !NimBLEDevice::getAdvertising()->isAdvertising())
-      NimBLEDevice::startAdvertising();
-  }
+  static unsigned long lastFrame = 0;
+  bleMaintenance();
   handleNetwork();
   handleUdp();
   unsigned long now = millis();
