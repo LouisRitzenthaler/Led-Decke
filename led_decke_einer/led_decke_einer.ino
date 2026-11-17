@@ -49,6 +49,9 @@ const bool B_STARTS_AT_TOP[COLS] = {true, true, true, true, true, true, true};
 #define MAX_BRIGHTNESS 160
 #define FPS 20
 #define MAX_SCENES 10
+// WLAN-Energiesparen aus? Verhindert verpasste Hotspot-Signale (weniger Abbrüche),
+// kann aber Bluetooth stören. Erst auf true setzen, wenn die Abbrüche bleiben.
+#define WIFI_NO_SLEEP false
 // Bluetooth-Selbstheilung: ist 30 Minuten lang niemand verbunden, wird Bluetooth
 // einmal komplett neu gestartet (ca. 1 Sekunde nicht sichtbar). 0 = nie.
 #define BLE_IDLE_RESTART_MS (30UL * 60UL * 1000UL)
@@ -184,6 +187,14 @@ bool otaStarted = false;
 void bluetoothPause(bool pause);
 const char *runCommand(JsonDocument &doc);  // weiter unten
 String stateJson();                         // weiter unten
+bool everConnected = false;    // war seit dem Einschalten schon einmal verbunden
+bool wifiWasUp = false;
+bool udpReset = false;         // nach neuer Verbindung den UDP-Port neu öffnen
+uint8_t reconnectFails = 0;
+unsigned long lostAt = 0, lastKeepalive = 0;
+volatile uint8_t wifiLastReason = 0;  // Grund des letzten Verbindungsabbruchs (ESP-IDF-Code)
+uint32_t wifiDrops = 0;
+WiFiUDP keepUdp;
 unsigned long lastWifiTry = 0;
 unsigned long wifiUntil = 120000;  // bis dahin (ms seit Start) darf das WLAN suchen
 bool wifiOff = false;
@@ -191,7 +202,11 @@ bool wifiOff = false;
 void startWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
-  WiFi.setAutoReconnect(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(WIFI_NO_SLEEP ? false : true);
+  WiFi.onEvent([](arduino_event_id_t ev, arduino_event_info_t info) {
+    if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) wifiLastReason = info.wifi_sta_disconnected.reason;
+  });
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.printf("Verbinde mit WLAN \"%s\"", WIFI_SSID);
   for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
@@ -229,19 +244,53 @@ void httpState() {
 // In jeder loop() aufrufen: hält WLAN und die Update-Wege am Leben.
 void handleNetwork() {
   if (wifiOff) return;
+  unsigned long now = millis();
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() > wifiUntil && !Update.isRunning()) {
+    if (wifiWasUp) {
+      wifiWasUp = false;
+      wifiDrops++;
+      lostAt = now;
+      Serial.printf("WLAN verloren (Grund %d)\n", (int)wifiLastReason);
+    }
+    // Nie verbunden gewesen: nach 2 Minuten aufgeben (Bluetooth hat Vorrang).
+    // Schon einmal verbunden gewesen: nie mehr aufgeben, immer wieder neu verbinden.
+    if (!everConnected && now > wifiUntil && !Update.isRunning()) {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       wifiOff = true;
       Serial.println("Kein Hotspot - WLAN aus (nur noch Bluetooth)");
-    } else if (millis() - lastWifiTry > 15000) {
-      lastWifiTry = millis();
-      WiFi.reconnect();
+      return;
+    }
+    unsigned long every = (everConnected && now - lostAt > 120000) ? 30000 : 15000;
+    if (now - lastWifiTry > every) {
+      lastWifiTry = now;
+      if (++reconnectFails % 4 == 0) {  // jeder 4. Versuch: komplett neu anmelden
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      } else {
+        WiFi.reconnect();
+      }
     }
     return;
   }
-  wifiUntil = millis() + 120000;  // verbunden: bleibt an, bei Verlust 2 Minuten weitersuchen
+  if (!wifiWasUp) {
+    wifiWasUp = true;
+    reconnectFails = 0;
+    if (everConnected) {
+      udpReset = true;
+      Serial.println("WLAN wieder da");
+    }
+    everConnected = true;
+  }
+  wifiUntil = now + 120000;
+  // Lebenszeichen: alle 10 s ein winziges Paket an den Hotspot, damit er die Decke nicht als untätig ansieht
+  if (now - lastKeepalive > 10000) {
+    lastKeepalive = now;
+    if (keepUdp.beginPacket(WiFi.gatewayIP(), 9)) {
+      keepUdp.write((uint8_t)0);
+      keepUdp.endPacket();
+    }
+  }
   if (!otaStarted) {
     otaStarted = true;
     ArduinoOTA.setHostname(HOSTNAME);
@@ -865,7 +914,10 @@ String stateJson() {
   }
   JsonArray ef = d["effects"].to<JsonArray>();
   for (int i = 0; i < NUM_EFFECTS; i++) ef.add(EFFECT_IDS[i]);
+  d["wifi_connected"] = WiFi.status() == WL_CONNECTED;
   d["wifi_rssi"] = WiFi.RSSI();
+  d["wifi_drops"] = wifiDrops;
+  d["wifi_last_reason"] = (int)wifiLastReason;
   NimBLEServer *srv = NimBLEDevice::getServer();
   d["ble_clients"] = srv ? srv->getConnectedCount() : 0;
   d["ble_advertising"] = srv ? NimBLEDevice::getAdvertising()->isAdvertising() : false;
@@ -1011,6 +1063,11 @@ bool udpStarted = false;
 
 void handleUdp() {
   if (WiFi.status() != WL_CONNECTED) return;
+  if (udpReset) {
+    udp.stop();
+    udpStarted = false;
+    udpReset = false;
+  }
   if (!udpStarted) udpStarted = udp.begin(UDP_PORT);
   if (!udpStarted) return;
   static char in[512];
