@@ -18,6 +18,7 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <NimBLEDevice.h>
+#include <esp_task_wdt.h>
 
 // ======================= EINSTELLUNGEN =======================
 #define BLE_NAME "LED-Decke"
@@ -58,6 +59,18 @@ const bool B_STARTS_AT_TOP[COLS] = {true, true, true, true, true, true, true};
 // Sind alle Bluetooth-Plätze belegt, aber 10 Minuten lang kam nichts mehr an
 // (Geisterverbindung), werden alle Verbindungen getrennt.
 #define BLE_GHOST_MS (10UL * 60UL * 1000UL)
+// Verbunden, aber seit dieser Zeit weder gelesen noch geschrieben (der Pi liest 10x pro
+// Sekunde): die Verbindung ist tot/"stumm" und wird getrennt. Ein Handy, das nur
+// offen herumliegt, wird dadurch nach der Zeit auch getrennt (die App verbindet neu).
+#define BLE_SILENT_MS (60UL * 1000UL)
+// Nach einer neuen Verbindung muss innerhalb dieser Zeit etwas gelesen/geschrieben werden,
+// sonst wird sie getrennt (genau das "Pi blinkt nur gelb"-Problem).
+#define BLE_HANDSHAKE_MS (12UL * 1000UL)
+// Hilft alles nichts (so oft hintereinander getrennt ohne dass je etwas ankam),
+// startet die Decke ganz neu. 0 = nie.
+#define BLE_KICKS_BEFORE_RESTART 4
+// Haengt die Hauptschleife länger als das, startet die Decke neu (Watchdog). 0 = aus.
+#define LOOP_WATCHDOG_S 45
 // =============================================================
 
 #define BLE_SERVICE_UUID "6e1d0001-8a3c-4c5b-9b1e-1ed0c0dec0de"
@@ -185,6 +198,13 @@ WebServer web(80);
 HTTPUpdateServer webUpdater;
 bool otaStarted = false;
 void bluetoothPause(bool pause);
+// Watchdog: haengt loop() laenger als LOOP_WATCHDOG_S, startet die Decke neu.
+void loopWatchdog(bool on) {
+#if LOOP_WATCHDOG_S > 0
+  if (on) esp_task_wdt_add(NULL);
+  else esp_task_wdt_delete(NULL);
+#endif
+}
 const char *runCommand(JsonDocument &doc);  // weiter unten
 String stateJson();                         // weiter unten
 bool everConnected = false;    // war seit dem Einschalten schon einmal verbunden
@@ -296,14 +316,15 @@ void handleNetwork() {
     ArduinoOTA.setHostname(HOSTNAME);
     if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
     // Während des Updates Bluetooth trennen, sonst bricht das Update ab
-    ArduinoOTA.onStart([] { Serial.println("Update startet ..."); bluetoothPause(true); });
-    ArduinoOTA.onError([](ota_error_t) { bluetoothPause(false); });
+    ArduinoOTA.onStart([] { Serial.println("Update startet ..."); bluetoothPause(true); loopWatchdog(false); });
+    ArduinoOTA.onError([](ota_error_t) { bluetoothPause(false); loopWatchdog(true); });
     ArduinoOTA.begin();  // startet auch mDNS: led-decke-reihe1.local
     MDNS.addService("http", "tcp", 80);
     webUpdater.setup(&web);  // Notfall-Update im Browser: http://IP/update
-    web.on("/", [] { web.send(200, "text/plain", "LED-Decke laeuft. POST /api (JSON), GET /state"); });
+    web.on("/", [] { web.send(200, "text/plain", "LED-Decke laeuft. POST /api (JSON), GET /state, GET /log"); });
     web.on("/api", HTTP_POST, httpApi);
     web.on("/state", HTTP_GET, httpState);
+    web.on("/log", HTTP_GET, [] { web.send(200, "text/plain; charset=utf-8", logText()); });
     web.begin();
     Serial.printf("WLAN ok: http://%s, Update-Name \"%s\"\n", WiFi.localIP().toString().c_str(), HOSTNAME);
   }
@@ -846,6 +867,45 @@ volatile unsigned long lastBleActivity = 0;  // zuletzt kam ein Befehl / wurde e
 volatile unsigned long lastBleClient = 0;    // zuletzt war jemand verbunden
 volatile bool bleRestartRequested = false;   // wird in loop() ausgeführt
 uint32_t bleRestarts = 0;
+bool blePaused = false;                       // während eines WLAN-Updates bleibt Bluetooth aus
+volatile unsigned long lastBleConnectAt = 0;  // letzte neue Verbindung
+volatile uint32_t bleConnects = 0, bleDisconnects = 0, bleKicks = 0;
+volatile int bleLastDiscReason = 0;
+uint8_t bleKickStreak = 0;                    // Trennungen hintereinander ohne dass je etwas ankam
+unsigned long bleLastKickAt = 0;
+
+// Kleines Ereignis-Protokoll (die letzten 24 Meldungen), abrufbar unter GET /log
+const int LOG_LINES = 24;
+char logBuf[LOG_LINES][72];
+uint32_t logCount = 0;
+portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;
+void logEvent(const char *fmt, ...) {
+  char tmp[72];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(tmp, sizeof(tmp) - 12, fmt, ap);
+  va_end(ap);
+  char line[72];
+  snprintf(line, sizeof(line), "%lus %s", millis() / 1000, tmp);
+  Serial.println(line);
+  portENTER_CRITICAL(&logMux);
+  memcpy(logBuf[logCount % LOG_LINES], line, sizeof(line));
+  logCount++;
+  portEXIT_CRITICAL(&logMux);
+}
+String logText() {
+  String out;
+  uint32_t n = logCount, from = n > LOG_LINES ? n - LOG_LINES : 0;
+  for (uint32_t i = from; i < n; i++) {
+    char line[72];
+    portENTER_CRITICAL(&logMux);
+    memcpy(line, logBuf[i % LOG_LINES], sizeof(line));
+    portEXIT_CRITICAL(&logMux);
+    out += line;
+    out += '\n';
+  }
+  return out;
+}
 
 // Zustand binär: [1, mode, helligkeit, max, tempo*10, r,g,b, rows, cols, boxes..., frame...]
 const size_t STATE_SIZE = 10 + ROWS * COLS * 6;
@@ -923,6 +983,11 @@ String stateJson() {
   d["ble_advertising"] = srv ? NimBLEDevice::getAdvertising()->isAdvertising() : false;
   d["ble_restarts"] = bleRestarts;
   d["ble_idle_s"] = (millis() - lastBleClient) / 1000;
+  d["ble_connects"] = bleConnects;
+  d["ble_disconnects"] = bleDisconnects;
+  d["ble_last_disc_reason"] = bleLastDiscReason;  // 520 = Supervision-Timeout, 534 = Gegenseite hat getrennt
+  d["ble_kicks"] = bleKicks;                      // so oft hat die Decke eine stumme Verbindung selbst getrennt
+  d["ble_activity_age_s"] = (millis() - lastBleActivity) / 1000;
   d["free_heap"] = ESP.getFreeHeap();
   d["min_free_heap"] = ESP.getMinFreeHeap();
   d["uptime_s"] = millis() / 1000;
@@ -942,6 +1007,7 @@ class StateCallbacks : public NimBLECharacteristicCallbacks {
 
 class ScenesCallbacks : public NimBLECharacteristicCallbacks {
   void onRead(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    lastBleActivity = millis();
     Lock l;
     c->setValue(sceneNamesJson());
   }
@@ -950,6 +1016,7 @@ class ScenesCallbacks : public NimBLECharacteristicCallbacks {
 // Mikrofon-Anzeige: [1, Empfindlichkeit, Pegel 0..255, Schläge, Signal min, Signal max, Bass, Schwelle] (je 2 Byte)
 class MicCallbacks : public NimBLECharacteristicCallbacks {
   void onRead(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    lastBleActivity = millis();
     uint8_t b[12];
     uint16_t w[4] = {micRawMin, micRawMax, micBass, micGate};
     b[0] = 1; b[1] = micSens; b[2] = micLevel * 255; b[3] = micBeats & 0xff;
@@ -971,12 +1038,22 @@ class CmdCallbacks : public NimBLECharacteristicCallbacks {
 // Nach jeder Verbindung weiter sichtbar bleiben: Handy und Raspberry Pi gleichzeitig
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *srv, NimBLEConnInfo &info) override {
-    lastBleClient = lastBleActivity = millis();
+    lastBleClient = lastBleActivity = lastBleConnectAt = millis();
+    bleConnects++;
+    logEvent("BLE verbunden (Platz %d)", (int)srv->getConnectedCount());
+    // Langes Supervision-Timeout (4 s): WLAN-Suchen oder Flash-Schreiben darf die Verbindung
+    // nicht sofort abreissen lassen (Linux nimmt sonst nur 0,42 s). Einheiten: 1,25 ms / 10 ms.
+    srv->updateConnParams(info.getConnHandle(), 24, 40, 0, 400);
     if (srv->getConnectedCount() < CONFIG_BT_NIMBLE_MAX_CONNECTIONS) NimBLEDevice::startAdvertising();
+  }
+  void onDisconnect(NimBLEServer *srv, NimBLEConnInfo &info, int reason) override {
+    bleDisconnects++;
+    bleLastDiscReason = reason;
+    logEvent("BLE getrennt (Grund %d)", reason);
+    if (!blePaused) NimBLEDevice::startAdvertising();  // immer sofort wieder sichtbar werden
   }
 };
 
-bool blePaused = false;  // während eines WLAN-Updates bleibt Bluetooth aus
 void bluetoothPause(bool pause) {
   blePaused = pause;
   NimBLEServer *srv = NimBLEDevice::getServer();
@@ -994,16 +1071,21 @@ void startBle() {
   NimBLEDevice::init(BLE_NAME);
   NimBLEDevice::setMTU(517);
   NimBLEServer *srv = NimBLEDevice::createServer();
-  srv->setCallbacks(new ServerCallbacks());
+  static ServerCallbacks serverCb;
+  static CmdCallbacks cmdCb;
+  static StateCallbacks stateCb;
+  static ScenesCallbacks scenesCb;
+  static MicCallbacks micCb;
+  srv->setCallbacks(&serverCb, false);
   srv->advertiseOnDisconnect(true);
   NimBLEService *svc = srv->createService(BLE_SERVICE_UUID);
-  svc->createCharacteristic(BLE_CMD_UUID, NIMBLE_PROPERTY::WRITE, 512)->setCallbacks(new CmdCallbacks());
+  svc->createCharacteristic(BLE_CMD_UUID, NIMBLE_PROPERTY::WRITE, 512)->setCallbacks(&cmdCb);
   bleState = svc->createCharacteristic(BLE_STATE_UUID, NIMBLE_PROPERTY::READ, 512);
-  bleState->setCallbacks(new StateCallbacks());
+  bleState->setCallbacks(&stateCb);
   bleScenes = svc->createCharacteristic(BLE_SCENES_UUID, NIMBLE_PROPERTY::READ, 512);
-  bleScenes->setCallbacks(new ScenesCallbacks());
+  bleScenes->setCallbacks(&scenesCb);
   bleMic = svc->createCharacteristic(BLE_MIC_UUID, NIMBLE_PROPERTY::READ, 16);
-  bleMic->setCallbacks(new MicCallbacks());
+  bleMic->setCallbacks(&micCb);
   svc->start();
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   adv->setName(BLE_NAME);
@@ -1016,11 +1098,22 @@ void startBle() {
 
 // Bluetooth komplett abbauen und neu aufbauen (letzter Ausweg bei hängendem Bluetooth)
 void restartBle(const char *why) {
-  Serial.printf("Bluetooth wird neu gestartet (%s)\n", why);
+  logEvent("BLE-Neustart: %s", why);
   NimBLEDevice::deinit(true);
   delay(300);
   startBle();
   bleRestarts++;
+}
+
+// Trennt alle Verbindungen (Geister/stumme Verbindungen)
+void bleKickAll(const char *why) {
+  NimBLEServer *srv = NimBLEDevice::getServer();
+  if (!srv) return;
+  bleKicks++;
+  bleKickStreak++;
+  bleLastKickAt = millis();
+  logEvent("BLE: trenne alle (%s), Serie %d", why, (int)bleKickStreak);
+  for (uint16_t h : srv->getPeerDevices()) srv->disconnect(h);
 }
 
 // Alle 3 Sekunden aus loop(): Bluetooth am Leben halten
@@ -1042,13 +1135,34 @@ void bleMaintenance() {
   }
   int n = srv->getConnectedCount();
   if (n > 0) lastBleClient = now;
+  // Es kam seit dem letzten Trennen wieder echte Arbeit an: Serie zurücksetzen
+  if (bleKickStreak && lastBleActivity > bleLastKickAt && lastBleActivity > lastBleConnectAt) bleKickStreak = 0;
+
+  // Verbunden, aber nie etwas gelesen/geschrieben (Pi hängt im Verbindungsaufbau): trennen
+  if (n > 0 && lastBleActivity <= lastBleConnectAt && now - lastBleConnectAt > BLE_HANDSHAKE_MS)
+    bleKickAll("Verbindung bleibt stumm");
+  // Lange gar nichts mehr: tote Verbindung
+  else if (n > 0 && now - lastBleActivity > BLE_SILENT_MS) bleKickAll("lange keine Daten");
+
+  // Immer wieder getrennt, nie kam etwas an: erst Bluetooth, dann die ganze Decke neu starten
+  if (bleKickStreak == 2) {
+    restartBle("Verbindungen blieben stumm");
+    bleKickStreak = 3;  // nur einmal pro Serie
+  }
+  if (BLE_KICKS_BEFORE_RESTART > 0 && bleKickStreak >= BLE_KICKS_BEFORE_RESTART) {
+    logEvent("Decke startet neu (Bluetooth haengt)");
+    delay(200);
+    ESP.restart();
+  }
+
   // Solange ein Platz frei ist, muss die Decke sichtbar und verbindbar sein
-  if (n < CONFIG_BT_NIMBLE_MAX_CONNECTIONS && !NimBLEDevice::getAdvertising()->isAdvertising())
+  if (n < CONFIG_BT_NIMBLE_MAX_CONNECTIONS && !NimBLEDevice::getAdvertising()->isAdvertising()) {
+    logEvent("BLE: Werbung war aus, starte neu");
     NimBLEDevice::startAdvertising();
+  }
   // Alle Plätze belegt, aber lange nichts passiert: Geisterverbindungen trennen
   if (n >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS && now - lastBleActivity > BLE_GHOST_MS) {
-    Serial.println("Bluetooth: Geisterverbindungen werden getrennt");
-    for (uint16_t h : srv->getPeerDevices()) srv->disconnect(h);
+    bleKickAll("alle Plaetze belegt, nichts passiert");
     lastBleActivity = now;
   }
   // Lange niemand verbunden: Bluetooth vorsorglich neu starten
@@ -1103,11 +1217,24 @@ void setup() {
   showAll();
   startBle();  // Bluetooth zuerst, damit Pi und Handy nicht auf das WLAN warten
   startWifi();
+#if LOOP_WATCHDOG_S > 0
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t wdt = {.timeout_ms = LOOP_WATCHDOG_S * 1000, .idle_core_mask = 0, .trigger_panic = true};
+  if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
+#else
+  esp_task_wdt_init(LOOP_WATCHDOG_S, true);
+#endif
+  loopWatchdog(true);
+#endif
+  logEvent("Start (Neustart-Grund %d)", (int)esp_reset_reason());
   Serial.printf("\nLED-Decke: 14 Streifen x %d LEDs\n", LEDS_PER_STRIP);
 }
 
 void loop() {
   static unsigned long lastFrame = 0;
+#if LOOP_WATCHDOG_S > 0
+  esp_task_wdt_reset();
+#endif
   bleMaintenance();
   handleNetwork();
   handleUdp();

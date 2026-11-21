@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/reboot.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -555,7 +556,8 @@ static int read_state(void) {
 
 /* Wo steht die Bluetooth-Verbindung? Das Launchpad zeigt es beim Warten als Farbe:
  * 0 rot = Bluetooth startet, 1 blau = suche die Decke, 2 lila = Decke gefunden, verbinde,
- * 3 gelb = verbunden, frage die Decke ab, 4 türkis = lese den Zustand, 5 weiß = Zustand unlesbar */
+ * 3 gelb = verbunden, frage die Decke ab, 4 türkis = lese den Zustand, 5 weiß = Zustand unlesbar,
+ * 6 orange = verbunden, aber die Decke antwortet nicht (Decke hängt), 7 rosa = Verbindung gerade abgerissen */
 static volatile int g_stage;
 
 /* Bluetooth-Chip aus- und wieder einschalten (wenn sich nichts mehr verbinden lässt) */
@@ -577,6 +579,8 @@ static void *ble_thread(void *arg) {
         msleep(100);
     }
     while (bt_power_on() < 0) msleep(500);
+    bt_restart(); /* beim Start einmal aus/an: räumt Reste einer alten Verbindung im Bluetooth-Chip weg */
+    int silent = 0; /* Verbindungen hintereinander, bei denen die Decke nicht geantwortet hat */
     char pending[CMDLEN];
     for (;;) {
         if (fails >= 3) { /* dreimal hintereinander nichts: Bluetooth frisch starten */
@@ -633,7 +637,23 @@ static void *ble_thread(void *arg) {
                         }
                     }
                 }
-                say("Bluetooth-Verbindung weg");
+                say("Bluetooth-Verbindung weg (nach %.0f s)", now() - t_conn);
+                g_stage = 7;
+                silent = 0;
+            } else {
+                /* Verbunden, aber keine Antwort auf die Anfragen: die Decke hängt oder ist noch mit
+                 * einer alten Verbindung beschäftigt. Kurz warten, damit sie die Verbindung abbauen kann. */
+                say("Decke antwortet nicht (Anfrage %d), Verbindung wird getrennt", silent + 1);
+                g_stage = 6;
+                msleep(1500);
+                if (++silent >= 2) { /* zweimal hintereinander: Bluetooth-Chip hier auch frisch starten */
+                    close(att_fd);
+                    att_fd = -1;
+                    bt_restart();
+                    silent = 0;
+                    fails = 0;
+                    continue;
+                }
             }
             close(att_fd);
             att_fd = -1;
@@ -1505,6 +1525,12 @@ static void app_main(void) {
             say("Decke weg, starte neu");
             exit(1);
         }
+        /* Seit dem Start nie mit der Decke verbunden gewesen (Bluetooth oder Decke hängt): nach 3 Minuten
+         * das Programm neu starten (wird oben im Hauptprogramm mitgezählt, siehe RESTARTS_BEFORE_REBOOT) */
+        if (!ever && !ingame && t - started > 180) {
+            say("Seit 3 Minuten keine Verbindung, starte neu");
+            exit(1);
+        }
         memset(want, 0, sizeof want);
         int blink_on = ((long)(t * 3)) % 2 == 0;
 
@@ -1544,8 +1570,8 @@ static void app_main(void) {
             sel_clear();
             deselect_at = 0;
             int on = ((long)t) % 2 == 0;
-            static const uint8_t stage_col[6][3] = {{60, 0, 0}, {0, 0, 40}, {40, 0, 40}, {50, 40, 0}, {0, 40, 40}, {40, 40, 40}};
-            const uint8_t *sc = stage_col[g_stage % 6];
+            static const uint8_t stage_col[8][3] = {{60, 0, 0}, {0, 0, 40}, {40, 0, 40}, {50, 40, 0}, {0, 40, 40}, {40, 40, 40}, {70, 20, 0}, {60, 0, 25}};
+            const uint8_t *sc = stage_col[g_stage % 8];
             for (int i = 0; i < 128; i++) {
                 if (is_box[i]) set_led(i, on ? sc[0] : 0, on ? sc[1] : 0, on ? sc[2] : 0);
                 else if (func_of[i] == F_GAME) set_led(i, 255, 0, 255); /* Spiele gehen auch ohne Decke */
@@ -1703,6 +1729,18 @@ static void switch_to_normal(void) {
     say("/sbin/init startet nicht: %s", strerror(errno));
 }
 
+#define RESTARTS_BEFORE_REBOOT 4
+
+static double uptime_s(void) {
+    FILE *f = fopen("/proc/uptime", "r");
+    double u = 0;
+    if (f) {
+        if (fscanf(f, "%lf", &u) != 1) u = 0;
+        fclose(f);
+    }
+    return u;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -1742,11 +1780,28 @@ int main(int argc, char **argv) {
         /* hat nicht geklappt: Mini-System weiterlaufen lassen */
         app = -1;
     }
+    double restart_t[RESTARTS_BEFORE_REBOOT];
+    int n_restarts = 0;
     for (;;) { /* Programm bei Absturz/Neustart-Wunsch sofort neu starten */
         int st;
         pid_t p = app > 0 ? waitpid(-1, &st, 0) : -1;
         if (app <= 0 || p == app) {
-            if (app > 0) msleep(300);
+            if (app > 0) {
+                /* Läuft das Programm immer wieder ohne Erfolg neu (Bluetooth-Chip hängt), hilft nur ein
+                 * Neustart des ganzen Pi. Höchstens einmal pro 15 Minuten, damit es keine Schleife wird. */
+                double tn = now();
+                if (n_restarts == RESTARTS_BEFORE_REBOOT) {
+                    memmove(restart_t, restart_t + 1, sizeof(double) * (RESTARTS_BEFORE_REBOOT - 1));
+                    n_restarts--;
+                }
+                restart_t[n_restarts++] = tn;
+                if (n_restarts == RESTARTS_BEFORE_REBOOT && tn - restart_t[0] < 900 && uptime_s() > 900) {
+                    say("Programm startet immer wieder neu: Raspberry Pi startet neu");
+                    sync();
+                    reboot(RB_AUTOBOOT);
+                }
+                msleep(300);
+            }
             app = fork();
             if (app == 0) {
                 if (have_update) execl("/led-mini-neu", "led-mini", (char *)NULL);
